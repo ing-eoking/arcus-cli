@@ -48,4 +48,13 @@ impl Conn {
             Transport::UNIX => ()
         }
     }
+
+    #[allow(dead_code)]
+    pub fn read(&mut self) -> String {
+        return match self.transport {
+            Transport::TCP => self.tcp.read(),
+            Transport::UDP => String::new(),
+            Transport::UNIX => String::new()
+        };
+    }
 }
