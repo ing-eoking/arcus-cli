@@ -1,8 +1,5 @@
-use async_std;
-use std::io::Write;
 use clap::{Parser, ArgAction};
-use rustyline_async::{Readline, ReadlineError, ReadlineEvent};
-use futures_util::{select, FutureExt};
+use rustyline::error::ReadlineError;
 
 mod connect;
 
@@ -31,41 +28,34 @@ struct Args {
 
 }
 
-#[async_std::main]
-async fn main() -> Result<(), ReadlineError> {
+fn main() -> rustyline::Result<()> {
     let args = Args::parse();
-    let (mut rl, mut stdout) = Readline::new("".to_owned()).unwrap();
-
+    let mut rl = rustyline::DefaultEditor::new()?;
+    #[cfg(feature = "with-file-history")]
+    if rl.load_history("history.txt").is_err() {
+        eprintln!("ERROR: No previous history.");
+        std::process::exit(1);
+    }
     let transport = if args.unix_path.len() > 0 { connect::Transport::UNIX }
                                else if args.udp { connect::Transport::UDP }
                                else { connect::Transport::TCP };
     let mut conn = connect::Conn::create();
     conn.connect(args.host, args.port, transport);
+    conn.activate_reader();
     loop {
-        select! {
-            command = rl.readline().fuse() => match command {
-                Ok(ReadlineEvent::Line(line)) => {
-                    rl.add_history_entry(line.to_owned());
-                    if line == "quit" { break }
-                    writeln!(stdout, "{}", line)?;
-                },
-                Ok(ReadlineEvent::Eof) => break,
-                Ok(ReadlineEvent::Interrupted) => break,
-                Err(err) => { writeln!(stdout, "ERROR: {}", err)?; break }
-            }
+        let readline = rl.readline("");
+        match readline {
+            Ok(line) => {
+                let _ = rl.add_history_entry(line.as_str());
+                if line == "quit" { break }
+                conn.write(line);
+            },
+            Err(ReadlineError::Interrupted) => { break },
+            Err(ReadlineError::Eof) => { break },
+            Err(err) => { eprintln!("ERROR: {:?}", err); break }
         }
-
-        //let readline = rl.readline("");
-        // match readline {
-        //     Ok(line) => {
-        //         let _ = rl.add_history_entry(line.as_str());
-        //         if line == "quit" { break }
-        //         conn.write(line);
-        //     },
-        //     Err(ReadlineError::Interrupted) => { break },
-        //     Err(ReadlineError::Eof) => { break },
-        //     Err(err) => { eprintln!("ERROR: {:?}", err); break }
-        // }
     }
+    #[cfg(feature = "with-file-history")]
+    rl.save_history("history.txt");
     Ok(())
 }

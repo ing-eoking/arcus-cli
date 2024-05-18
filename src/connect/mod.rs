@@ -49,12 +49,11 @@ impl Conn {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn read(&mut self) -> String {
-        return match self.transport {
-            Transport::TCP => self.tcp.read(),
-            Transport::UDP => String::new(),
-            Transport::UNIX => String::new()
+    pub fn activate_reader(&mut self) {
+        match self.transport {
+            Transport::TCP => self.tcp.reader(),
+            Transport::UDP => (),
+            Transport::UNIX => ()
         };
     }
 }
