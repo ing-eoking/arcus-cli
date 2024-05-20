@@ -1,0 +1,53 @@
+#!/usr/bin/perl
+
+use IO::Socket::INET;
+use Thread;
+
+my ($ip, $port) = @ARGV;
+my $reqid = 1;
+my $sock = new IO::Socket::INET (
+PeerAddr   => "$ip:$port",
+Proto      => 'udp'
+) or die "ERROR : $!\n";
+
+my $hdr = pack("nnnn", $reqid, 0, 1, 0);
+my ($running, $sync) :shared = (1, 1);
+
+
+my $thr = new Thread \&Response;
+$thr->detach;
+
+while($running eq 1) {
+    my $input = <STDIN>;
+    $input =~ s/\n/\r\n/;
+    my $cmd = ($sync == 1) ? ($hdr . $input) : ($input);
+    $sock->send($cmd);
+    $sync = 0;
+    if ($input eq "quit\r\n") {
+        $running = 0;
+    }
+}
+
+$sock->close();
+
+sub Response {
+    while($running eq 1) {
+        my $got = 0;
+        my $pkts = 1;
+        my $resp = "";
+
+        while($got < $pkts) {
+            my $pkt;
+            $sock->recv($pkt, 1500, 0);
+            my ($resid, $total, $curr, $zero) = unpack("nnnn", substr($pkt, 0, 8));
+            if ($reqid != $resid || $resv != 0) {
+                print "PROTOCOL ERROR: INVALID HEADER\n";
+                last;
+            }
+            $pkts = $total;
+            print substr($pkt, 8);
+            $got++;
+        }
+        $sync = 1;
+    }
+}

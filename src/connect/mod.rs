@@ -1,7 +1,9 @@
 pub mod tcp;
+pub mod udp;
 
 use std::net::{ToSocketAddrs};
 use self::tcp::TcpClient;
+use self::udp::UdpClient;
 
 pub enum Transport {
     TCP,
@@ -12,6 +14,7 @@ pub enum Transport {
 pub struct Conn {
     transport: Transport,
     tcp: TcpClient,
+    udp: UdpClient,
 }
 
 impl Conn {
@@ -19,9 +22,11 @@ impl Conn {
         Conn {
             transport: Transport::TCP,
             tcp: tcp::TcpClient::create(),
+            udp: udp::UdpClient::create(),
         }
     }
-    pub fn connect(&mut self, host: String, port: u32, prot:Transport) {
+
+    pub fn connect(&mut self, host: String, port: u16, rqid: u16, prot:Transport) {
         let addrs_iter = format!("{}:{}", host, port).to_socket_addrs();
         let mut addrs_iter = match addrs_iter {
             Ok(addr) => addr,
@@ -33,7 +38,7 @@ impl Conn {
         self.transport = prot;
         match self.transport {
             Transport::TCP => self.tcp.connect(addrs_iter.next().unwrap()),
-            Transport::UDP => (),
+            Transport::UDP => self.udp.connect(addrs_iter.next().unwrap(), rqid),
             Transport::UNIX => ()
         }
     }
@@ -47,13 +52,5 @@ impl Conn {
             Transport::UDP => (),
             Transport::UNIX => ()
         }
-    }
-
-    pub fn activate_reader(&mut self) {
-        match self.transport {
-            Transport::TCP => self.tcp.reader(),
-            Transport::UDP => (),
-            Transport::UNIX => ()
-        };
     }
 }

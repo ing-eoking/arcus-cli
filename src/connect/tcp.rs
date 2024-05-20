@@ -19,9 +19,10 @@ impl TcpClient {
         self.addr = Some(address);
         match TcpStream::connect(address) {
             Ok(sock) => {
-                self.conn = Some(sock)
+                self.hand = self.activate_reader(sock.try_clone().unwrap());
+                self.conn = Some(sock);
             },
-            Err(err) => {   
+            Err(err) => {
                 eprintln!("ERROR: {}", err);
                 std::process::exit(1);
             }
@@ -35,10 +36,10 @@ impl TcpClient {
         };
     }
 
-    pub fn reader(&mut self) {
-        let mut rbuf = BufReader::new(self.conn.as_mut().unwrap().try_clone().unwrap());
+    fn activate_reader(&mut self, sock: TcpStream) -> Option<JoinHandle<()>> {
+        let mut rbuf = BufReader::new(sock);
         let mut line = String::new();
-        self.hand = Some(thread::spawn(move || {
+        return Some(thread::spawn(move || {
             loop {
                 match rbuf.read_line(&mut line) {
                     Err(err) => eprintln!("ERROR: {}", err),

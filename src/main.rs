@@ -12,7 +12,7 @@ struct Args {
 
     /// Port Number
     #[arg(short, long, default_value_t = 11211)]
-    port: u32,
+    port: u16,
 
     /// Use UDP protocol
     #[clap(long, short, action=ArgAction::SetTrue)]
@@ -20,7 +20,7 @@ struct Args {
 
     /// Request ID for UDP
     #[arg(long, default_value_t = 1)]
-    req_id: i32,
+    req_id: u16,
 
     /// Unix socket path (disables network support)
     #[arg(long, default_value_t = String::from(""))]
@@ -40,8 +40,7 @@ fn main() -> rustyline::Result<()> {
                                else if args.udp { connect::Transport::UDP }
                                else { connect::Transport::TCP };
     let mut conn = connect::Conn::create();
-    conn.connect(args.host, args.port, transport);
-    conn.activate_reader();
+    conn.connect(args.host, args.port, args.req_id, transport);
     loop {
         let readline = rl.readline("");
         match readline {
