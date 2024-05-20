@@ -1,7 +1,10 @@
-use clap::{Parser, ArgAction};
-use rustyline::error::ReadlineError;
-
+mod helper;
 mod connect;
+
+use rustyline::error::ReadlineError;
+use rustyline::history::DefaultHistory;
+use rustyline::Editor;
+use clap::{ArgAction, Parser};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -30,7 +33,9 @@ struct Args {
 
 fn main() -> rustyline::Result<()> {
     let args = Args::parse();
-    let mut rl = rustyline::DefaultEditor::new()?;
+    let h = helper::MyHelper::new();
+    let mut rl: Editor<helper::MyHelper, DefaultHistory> = Editor::new()?;
+    rl.set_helper(Some(h));
     #[cfg(feature = "with-file-history")]
     if rl.load_history("history.txt").is_err() {
         eprintln!("ERROR: No previous history.");
@@ -56,5 +61,6 @@ fn main() -> rustyline::Result<()> {
     }
     #[cfg(feature = "with-file-history")]
     rl.save_history("history.txt");
+    conn.destroy();
     Ok(())
 }

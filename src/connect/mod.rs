@@ -49,8 +49,15 @@ impl Conn {
         buf.push('\n');
         match self.transport {
             Transport::TCP => self.tcp.write(buf),
-            Transport::UDP => (),
+            Transport::UDP => self.udp.write(buf),
             Transport::UNIX => ()
+        }
+    }
+
+    pub fn destroy(&mut self) {
+        match self.transport {
+            Transport::TCP => self.tcp.destroy(),
+            _ => ()
         }
     }
 }

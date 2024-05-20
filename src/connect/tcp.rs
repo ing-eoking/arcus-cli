@@ -51,11 +51,19 @@ impl TcpClient {
             }
         }));
     }
-}
 
-impl Drop for TcpClient {
-    fn drop(&mut self) {
+    pub fn destroy(&mut self) {
         self.conn.as_mut().unwrap().shutdown(Shutdown::Write).unwrap();
         self.hand.take().unwrap().join().unwrap();
+        self.conn = None;
     }
 }
+
+//impl Drop for TcpClient {
+//    fn drop(&mut self) {
+//        if !self.conn.is_none() {
+//            self.conn.as_mut().unwrap().shutdown(Shutdown::Write).unwrap();
+//            self.hand.take().unwrap().join().unwrap();
+//        }
+//    }
+//}

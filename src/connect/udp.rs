@@ -24,4 +24,11 @@ impl UdpClient {
             }
         };
     }
+
+    pub fn write(&mut self, line: String) {
+        match self.conn.as_mut().unwrap().send_to(line.as_bytes(), self.addr.unwrap()) {
+            Err(err) => eprintln!("ERROR: {}", err),
+            _ => ()
+        }
+    }
 }
