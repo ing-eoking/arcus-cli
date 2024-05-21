@@ -1,7 +1,6 @@
 mod helper;
 mod connect;
 
-use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline::Editor;
 use clap::{ArgAction, Parser};
@@ -54,8 +53,6 @@ fn main() -> rustyline::Result<()> {
                 if line == "quit" { break }
                 conn.write(line);
             },
-            Err(ReadlineError::Interrupted) => { break },
-            Err(ReadlineError::Eof) => { break },
             Err(err) => { eprintln!("ERROR: {:?}", err); break }
         }
     }

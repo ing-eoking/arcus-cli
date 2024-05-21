@@ -56,6 +56,7 @@ impl TcpClient {
         self.conn.as_mut().unwrap().shutdown(Shutdown::Write).unwrap();
         self.hand.take().unwrap().join().unwrap();
         self.conn = None;
+        println!("CLI: Close");
     }
 }
 
