@@ -53,11 +53,4 @@ impl Conn {
             Transport::UNIX => ()
         }
     }
-
-    pub fn destroy(&mut self) {
-        match self.transport {
-            Transport::TCP => self.tcp.destroy(),
-            _ => ()
-        }
-    }
 }

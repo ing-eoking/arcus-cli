@@ -7,16 +7,18 @@ use std::thread::JoinHandle;
 pub struct TcpClient {
     addr: Option<SocketAddr>,
     conn: Option<TcpStream>,
-    hand: Option<JoinHandle<()>>
+    hand: Option<JoinHandle<()>>,
+    down: bool
 }
 
 impl TcpClient {
     pub fn create() -> Self {
-        TcpClient { addr: None, conn: None, hand: None }
+        TcpClient { addr: None, conn: None, hand: None, down: true }
     }
 
     pub fn connect(&mut self, address: SocketAddr) {
         self.addr = Some(address);
+        self.down = false;
         match TcpStream::connect(address) {
             Ok(sock) => {
                 self.hand = self.activate_reader(sock.try_clone().unwrap());
@@ -51,20 +53,13 @@ impl TcpClient {
             }
         }));
     }
-
-    pub fn destroy(&mut self) {
-        self.conn.as_mut().unwrap().shutdown(Shutdown::Write).unwrap();
-        self.hand.take().unwrap().join().unwrap();
-        self.conn = None;
-        println!("CLI: Close");
-    }
 }
 
-//impl Drop for TcpClient {
-//    fn drop(&mut self) {
-//        if !self.conn.is_none() {
-//            self.conn.as_mut().unwrap().shutdown(Shutdown::Write).unwrap();
-//            self.hand.take().unwrap().join().unwrap();
-//        }
-//    }
-//}
+impl Drop for TcpClient {
+    fn drop(&mut self) {
+        if !self.down {
+            self.conn.as_mut().unwrap().shutdown(Shutdown::Write).unwrap();
+            self.hand.take().unwrap().join().unwrap();
+        }
+    }
+}

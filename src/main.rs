@@ -3,6 +3,7 @@ mod connect;
 
 use rustyline::history::DefaultHistory;
 use rustyline::Editor;
+use rustyline::error::ReadlineError;
 use clap::{ArgAction, Parser};
 
 #[derive(Parser, Debug)]
@@ -53,11 +54,12 @@ fn main() -> rustyline::Result<()> {
                 if line == "quit" { break }
                 conn.write(line);
             },
+            Err(ReadlineError::Interrupted) => { break },
+            Err(ReadlineError::Eof) => { conn.write("quit".to_string()); break },
             Err(err) => { eprintln!("ERROR: {:?}", err); break }
         }
     }
     #[cfg(feature = "with-file-history")]
     rl.save_history("history.txt");
-    conn.destroy();
     Ok(())
 }
