@@ -1,6 +1,7 @@
 mod helper;
 mod connect;
 
+use std::{thread, time};
 use rustyline::history::DefaultHistory;
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
@@ -29,10 +30,15 @@ struct Args {
     #[arg(long, default_value_t = String::from(""))]
     unix_path: String,
 
+    /// Timeout(ms)
+    #[arg(short, long, default_value_t = 500)]
+    timeout: u64
+
 }
 
 fn main() -> rustyline::Result<()> {
     let args = Args::parse();
+    let timeout = time::Duration::from_millis(args.timeout);
     let h = helper::MyHelper::new();
     let mut rl: Editor<helper::MyHelper, DefaultHistory> = Editor::new()?;
     rl.set_helper(Some(h));
@@ -55,7 +61,7 @@ fn main() -> rustyline::Result<()> {
                 conn.write(line);
             },
             Err(ReadlineError::Interrupted) => { break },
-            Err(ReadlineError::Eof) => { conn.write("quit".to_string()); break },
+            Err(ReadlineError::Eof) => { thread::sleep(timeout); break },
             Err(err) => { eprintln!("ERROR: {:?}", err); break }
         }
     }
