@@ -77,6 +77,7 @@ impl CMDHint {
 
 pub fn arcus_hints() -> HashSet<CMDHint> {
     let mut set = HashSet::new();
+    set.insert(CMDHint::new("quit", "quit"));
     // K/V
     set.insert(CMDHint::new("get <key>", "get "));
     set.insert(CMDHint::new("gets <key>", "gets "));
@@ -123,5 +124,38 @@ pub fn arcus_hints() -> HashSet<CMDHint> {
     set.insert(CMDHint::new("bop position <key> <bkey> <order>\n* <order> = asc | desc", "bop position "));
     set.insert(CMDHint::new("bop gbp <key> <order> <position or \"position range\">\n", "bop gbp "));
     set.insert(CMDHint::new("bop pwg <key> <bkey> <order> [<count>]\n* <order> = asc | desc", "bop pwg "));
+    // Item attributes
+    set.insert(CMDHint::new("getattr <key> [<name> ...]", "getattr "));
+    set.insert(CMDHint::new("setattr <key> <name>=<value> [<name>=<value> ...]", "setattr "));
+    // Scan
+    set.insert(CMDHint::new("scan key <cursor> [count <count>] [match <pattern>] [type <type>]", "scan key "));
+    set.insert(CMDHint::new("scan prefix <cursor> [count <count>] [match <pattern>]", "scan prefix "));
+    // Admin
+    set.insert(CMDHint::new("flush_all [<delay>] [noreply]", "flush_all "));
+    set.insert(CMDHint::new("flush_prefix <prefix> [<delay>] [noreply]", "flush_prefix "));
+    set.insert(CMDHint::new("scrub [stale]", "scrub "));
+    set.insert(CMDHint::new("stats [settings|items|slabs|prefix|zookeeper]", "stats "));
+    set.insert(CMDHint::new("stats cachedump <slab_clsid> <limit> [forward|backward [sticky]]", "stats cachedump "));
+    set.insert(CMDHint::new("stats dump", "stats dump"));
+    set.insert(CMDHint::new("config verbosity [<verbose>]", "config verbosity "));
+    set.insert(CMDHint::new("config memlimit [<memsize>]", "config memlimit "));
+    set.insert(CMDHint::new("config zkfailstop [on|off]", "config zkfailstop "));
+    set.insert(CMDHint::new("config hbtimeout [<hbtimeout>]", "config hbtimeout "));
+    set.insert(CMDHint::new("config hbfailstop [hbfailstop]", "config hbfailstop "));
+    set.insert(CMDHint::new("config maxconns [<maxconn>]", "config maxconns "));
+    set.insert(CMDHint::new("config max_list_size [<max_size>]", "config max_list_size "));
+    set.insert(CMDHint::new("config max_set_size [<max_size>]", "config max_set_size "));
+    set.insert(CMDHint::new("config max_btree_size [<max_size>]", "config max_btree_size "));
+    set.insert(CMDHint::new("config max_map_size [<max_size>]", "config max_map_size "));
+    set.insert(CMDHint::new("config max_element_bytes [<maxbytes>]", "config max_element_bytes "));
+    set.insert(CMDHint::new("config scrub_count [<scrub_count>]", "config scrub_count "));
+    set.insert(CMDHint::new("cmdlog [start [<log_file_path>] | stop | stats]", "cmdlog "));
+    set.insert(CMDHint::new("dump start key [<prefix>] <filepath>", "dump start key "));
+    set.insert(CMDHint::new("dump stop", "dump stop"));
+    set.insert(CMDHint::new("zkensemble set <ensemble_list>", "zkensemble set "));
+    set.insert(CMDHint::new("zkensemble get", "zkensemble get"));
+    set.insert(CMDHint::new("zkensemble rejoin", "zkensemble rejoin"));
+    set.insert(CMDHint::new("help [<subcommand>]", "help "));
+    // Etc
     set
 }

@@ -26,7 +26,8 @@ impl Conn {
         }
     }
 
-    pub fn connect(&mut self, host: String, port: u16, rqid: u16, prot:Transport) {
+    pub fn connect(&mut self, host: String, port: u16,
+                              rqid: u16, time: u64, prot:Transport) {
         let addrs_iter = format!("{}:{}", host, port).to_socket_addrs();
         let mut addrs_iter = match addrs_iter {
             Ok(addr) => addr,
@@ -38,7 +39,7 @@ impl Conn {
         self.transport = prot;
         match self.transport {
             Transport::TCP => self.tcp.connect(addrs_iter.next().unwrap()),
-            Transport::UDP => self.udp.connect(addrs_iter.next().unwrap(), rqid),
+            Transport::UDP => self.udp.connect(addrs_iter.next().unwrap(), rqid, time),
             Transport::UNIX => ()
         }
     }

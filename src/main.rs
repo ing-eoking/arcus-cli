@@ -31,7 +31,7 @@ struct Args {
     unix_path: String,
 
     /// Timeout(ms)
-    #[arg(short, long, default_value_t = 500)]
+    #[arg(short, long, default_value_t = 100)]
     timeout: u64
 
 }
@@ -51,7 +51,8 @@ fn main() -> rustyline::Result<()> {
                                else if args.udp { connect::Transport::UDP }
                                else { connect::Transport::TCP };
     let mut conn = connect::Conn::create();
-    conn.connect(args.host, args.port, args.req_id, transport);
+    conn.connect(args.host, args.port,
+                 args.req_id, args.timeout, transport);
     loop {
         let readline = rl.readline("");
         match readline {
