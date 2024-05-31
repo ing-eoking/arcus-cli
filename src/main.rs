@@ -31,7 +31,7 @@ struct Args {
     unix_path: String,
 
     /// Timeout(ms)
-    #[arg(short, long, default_value_t = 100)]
+    #[arg(short, long, default_value_t = 300)]
     timeout: u64
 
 }
