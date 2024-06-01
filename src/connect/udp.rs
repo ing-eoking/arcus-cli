@@ -54,10 +54,7 @@ impl UdpClient {
                     }
                     else { eprintln!("ERROR: {}", err); break; }
                 }
-                _ => {
-                    self.sync = false;
-                    break;
-                }
+                _ => { self.sync = false; break; }
             }
         }
         if !self.sync {
@@ -111,8 +108,8 @@ impl UdpClient {
         for i in 0..split {
             buffer[2] = (i / 255) as u8;
             buffer[3] = (i % 255) as u8;
-            let last     = if (i + 1) * MTU > line.len() { line.len() }
-                              else { (i + 1) * MTU };
+            let last = if (i + 1) * MTU > line.len() { line.len() }
+                       else { (i + 1) * MTU };
             ret.push([&buffer, line[i*MTU..last].as_bytes()].concat());
         }
         return ret;
@@ -122,8 +119,8 @@ impl UdpClient {
         let mut ret = Vec::new();
         let split = (line.len() + (MTU - 1)) / MTU;
         for i in 0..split {
-            let last= if (i + 1) * MTU > line.len() { line.len() }
-                              else { (i + 1) * MTU };
+            let last = if (i + 1) * MTU > line.len() { line.len() }
+                       else { (i + 1) * MTU };
             ret.push(line[i*MTU..last].as_bytes().to_vec());
         }
         return ret;

@@ -10,7 +10,7 @@ use clap::{ArgAction, Parser};
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Host name or IP
+    /// Host name or IP or Unix path
     #[arg(long, default_value_t = String::from("localhost"))]
     host: String,
 
@@ -19,16 +19,16 @@ struct Args {
     port: u16,
 
     /// Use UDP protocol
-    #[clap(long, short, action=ArgAction::SetTrue)]
+    #[clap(long, action=ArgAction::SetTrue)]
     udp: bool,
 
     /// Request ID for UDP
     #[arg(long, default_value_t = 1)]
     req_id: u16,
 
-    /// Unix socket path (disables network support)
-    #[arg(long, default_value_t = String::from(""))]
-    unix_path: String,
+    /// Use Unix socket (disables network support)
+    #[arg(long, action=ArgAction::SetTrue)]
+    unix: bool,
 
     /// Timeout(ms)
     #[arg(short, long, default_value_t = 300)]
@@ -47,12 +47,18 @@ fn main() -> rustyline::Result<()> {
         eprintln!("ERROR: No previous history.");
         std::process::exit(1);
     }
-    let transport = if args.unix_path.len() > 0 { connect::Transport::UNIX }
+    let transport = if args.unix { connect::Transport::UNIX }
                                else if args.udp { connect::Transport::UDP }
                                else { connect::Transport::TCP };
     let mut conn = connect::Conn::create();
-    conn.connect(args.host, args.port,
-                 args.req_id, args.timeout, transport);
+    let setting = connect::Setting {
+        addr: if args.unix { args.host }
+              else { format!("{}:{}", args.host, args.port) },
+        rqid: args.req_id,
+        time: args.timeout,
+        prot: transport
+    };
+    conn.connect(setting);
     loop {
         let readline = rl.readline("");
         match readline {
