@@ -31,7 +31,7 @@ struct Args {
     unix: bool,
 
     /// Timeout(ms)
-    #[arg(short, long, default_value_t = 300)]
+    #[arg(short, long, default_value_t = 1)]
     timeout: u64
 
 }

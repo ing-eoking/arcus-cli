@@ -50,7 +50,7 @@ impl UdpClient {
             match self.conn.as_mut().unwrap().recv_from(&mut buf) {
                 Err(err) => {
                     if err.kind() == io::ErrorKind::WouldBlock {
-                        self.sync = true;
+                        self.sync = !self.sync;
                     }
                     else { eprintln!("ERROR: {}", err); break; }
                 }
