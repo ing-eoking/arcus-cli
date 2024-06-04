@@ -11,7 +11,7 @@ use clap::{ArgAction, Parser};
 #[command(version, about, long_about = None)]
 struct Args {
     /// Host name or IP or Unix path
-    #[arg(long, default_value_t = String::from("localhost"))]
+    #[arg(long, default_value_t = String::from("127.0.0.1"))]
     host: String,
 
     /// Port Number
@@ -30,15 +30,15 @@ struct Args {
     #[arg(long, action=ArgAction::SetTrue)]
     unix: bool,
 
-    /// Timeout(ms)
-    #[arg(short, long, default_value_t = 1)]
+    /// Timeout(μs)
+    #[arg(short, long, default_value_t = 100)]
     timeout: u64
 
 }
 
 fn main() -> rustyline::Result<()> {
     let args = Args::parse();
-    let timeout = time::Duration::from_millis(args.timeout);
+    let timeout = time::Duration::from_micros(args.timeout);
     let h = helper::MyHelper::new();
     let mut rl: Editor<helper::MyHelper, DefaultHistory> = Editor::new()?;
     rl.set_helper(Some(h));

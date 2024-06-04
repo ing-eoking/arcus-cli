@@ -41,7 +41,7 @@ impl UdpClient {
     pub fn write(&mut self, line: String) {
         let msg = if self.sync { self.split_message(line) }
                       else { self.build_header(line) };
-        let mut buf = [0; MTU+100];
+        let mut buf = [0; MTU];
         for m in msg {
             match self.conn.as_mut().unwrap().send_to(&m, self.addr.unwrap()) {
                 Err(err) => { eprintln!("ERROR: {}", err); break; }
@@ -65,7 +65,8 @@ impl UdpClient {
             }
             let mut data: Vec<Vec<u8>> = vec![vec![]; hdr[2]];
             buf[8..].clone_into(data[hdr[1]].as_mut());
-            for _ in 1..hdr[3] {
+            for _ in 1..hdr[2] {
+                buf = [0; MTU];
                 match self.conn.as_mut().unwrap().recv_from(&mut buf) {
                     Ok(_) => {
                         hdr = self.parse_header(&buf[0..8]);
@@ -95,7 +96,7 @@ impl UdpClient {
         cvt[1] = 255 * head[2] as usize + head[3] as usize;
         cvt[2] = 255 * head[4] as usize + head[5] as usize;
         return cvt;
-}
+    }
 
     fn build_header(&mut self, line: String) -> Vec<Vec<u8>> {
         let mut ret = Vec::new();

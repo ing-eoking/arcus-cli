@@ -42,16 +42,16 @@ impl Conn {
         match &self.transport {
             Transport::UNIX => self.unix.connect(setting.addr),
             net => {
-                let addrs_iter = match setting.addr.to_socket_addrs() {
+                let mut addrs_iter = match setting.addr.to_socket_addrs() {
                     Ok(addr) => addr,
-                    Err(err) => {       
+                    Err(err) => {
                         eprintln!("ERROR: {}", err);
                         std::process::exit(1);
                     }
                 };
                 match net {
-                    Transport::TCP => self.tcp.connect(addrs_iter.last().unwrap()),
-                    Transport::UDP => self.udp.connect(addrs_iter.last().unwrap(), 
+                    Transport::TCP => self.tcp.connect(addrs_iter.next().unwrap()),
+                    Transport::UDP => self.udp.connect(addrs_iter.next().unwrap(),
                                                        setting.rqid, setting.time),
                     _ => ()
                 }
