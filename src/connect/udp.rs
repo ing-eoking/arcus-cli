@@ -1,25 +1,29 @@
 use std::io;
 use std::time::Duration;
-use std::net::{SocketAddr, UdpSocket};
-
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 
 const MTU: usize = 1400;
+
+#[derive(Default)]
 pub struct UdpClient {
-    rqid: u16,
+    pub rqid: u16,
+    pub time: u64,
     addr: Option<SocketAddr>,
     conn: Option<UdpSocket>,
     sync: bool,
 }
 
 impl UdpClient {
-    pub fn create() -> Self {
-        UdpClient { rqid: 1, addr: None, conn: None, sync: false }
-    }
+    pub fn connect(&mut self, address: &str) {
+        let addrs_iter = match address.to_socket_addrs() {
+            Ok(addrs) => addrs.collect::<Vec<_>>(),
+            Err(err) => {
+                eprintln!("ERROR: {}", err);
+                std::process::exit(1);
+            }
+        };
 
-    pub fn connect(&mut self, address: SocketAddr, request_id: u16, timeout: u64) {
-        self.addr = Some(address);
-        self.rqid = request_id;
-        let timeout = Some(Duration::from_millis(timeout));
+        let timeout = Some(Duration::from_millis(self.time));
         match UdpSocket::bind("127.0.0.1:0") {
             Ok(sock) => {
                 match sock.set_read_timeout(timeout) {
@@ -31,11 +35,12 @@ impl UdpClient {
                 }
                 self.conn = Some(sock);
             }
-            Err(err) => {
-                eprintln!("ERROR: {}", err);
-                std::process::exit(1);
-            }
+            Err(err) => eprintln!("ERROR: {}", err)
         };
+        for addr in addrs_iter {
+            self.addr = Some(addr);
+            break; /* TODO */
+        }
     }
 
     pub fn write(&mut self, line: String) {

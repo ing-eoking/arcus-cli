@@ -2,60 +2,42 @@ pub mod tcp;
 pub mod udp;
 pub mod unix;
 
-use std::net::ToSocketAddrs;
 use self::tcp::TcpClient;
 use self::udp::UdpClient;
 use self::unix::UnixClient;
 
+#[derive(Default)]
 pub enum Transport {
-    TCP,
-    UDP,
-    UNIX
+    #[default]
+    NONE,
+    TCP(String, TcpClient),
+    UDP(String, UdpClient),
+    UNIX(String, UnixClient)
 }
 
-pub struct Setting {
-    pub addr: String,
-    pub rqid: u16,
-    pub time: u64,
-    pub prot: Transport
-}
 
+#[derive(Default)]
 pub struct Conn {
     transport: Transport,
-    tcp: TcpClient,
-    udp: UdpClient,
-    unix: UnixClient
 }
 
 impl Conn {
-    pub fn create() -> Self {
-        Conn {
-            transport: Transport::TCP,
-            tcp: tcp::TcpClient::create(),
-            udp: udp::UdpClient::create(),
-            unix: unix::UnixClient::create()
-        }
-    }
+    pub fn connect(&mut self, transport: Transport, rqid: u16, time: u64) {
+        self.transport = transport;
 
-    pub fn connect(&mut self, setting: Setting) {
-        self.transport = setting.prot;
-        match &self.transport {
-            Transport::UNIX => self.unix.connect(setting.addr),
-            net => {
-                let mut addrs_iter = match setting.addr.to_socket_addrs() {
-                    Ok(addr) => addr,
-                    Err(err) => {
-                        eprintln!("ERROR: {}", err);
-                        std::process::exit(1);
-                    }
-                };
-                match net {
-                    Transport::TCP => self.tcp.connect(addrs_iter.next().unwrap()),
-                    Transport::UDP => self.udp.connect(addrs_iter.next().unwrap(),
-                                                       setting.rqid, setting.time),
-                    _ => ()
-                }
-            }
+        match &mut self.transport {
+            Transport::TCP(addr, clnt) => {
+                clnt.connect(addr);
+            },
+            Transport::UDP(addr, clnt) => {
+                clnt.rqid = rqid;
+                clnt.time = time;
+                clnt.connect(addr);
+            },
+            Transport::UNIX(addr, clnt) => {
+                clnt.connect(addr);
+            },
+            _ => {}
         }
     }
 
@@ -63,10 +45,11 @@ impl Conn {
         let mut buf = line;
         if buf.len() > 0 && &buf[buf.len() - 1..] != "\r" { buf.push('\r'); }
         buf.push('\n');
-        match self.transport {
-            Transport::TCP => self.tcp.write(buf),
-            Transport::UDP => self.udp.write(buf),
-            Transport::UNIX => self.unix.write(buf)
+        match &mut self.transport {
+            Transport::TCP(_, clnt) => clnt.write(buf),
+            Transport::UDP(_, clnt) => clnt.write(buf),
+            Transport::UNIX(_, clnt) => clnt.write(buf),
+            _ => ()
         }
     }
 }

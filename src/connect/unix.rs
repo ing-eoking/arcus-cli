@@ -5,6 +5,7 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::thread::JoinHandle;
 
+#[derive(Default)]
 pub struct UnixClient {
     addr: Option<String>,
     conn: Option<UnixStream>,
@@ -13,12 +14,8 @@ pub struct UnixClient {
 }
 
 impl UnixClient {
-    pub fn create() -> Self {
-        UnixClient { addr: None, conn: None, hand: None, down: true }
-    }
-
-    pub fn connect(&mut self, address: String) {
-        self.addr = Some(address);
+    pub fn connect(&mut self, address: &str) {
+        self.addr = Some(address.to_string());
         self.down = false;
         match UnixStream::connect(self.addr.as_mut().unwrap()) {
             Ok(sock) => {

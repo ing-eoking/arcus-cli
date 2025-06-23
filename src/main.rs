@@ -33,7 +33,6 @@ struct Args {
     /// Timeout(μs)
     #[arg(short, long, default_value_t = 100)]
     timeout: u64
-
 }
 
 fn main() -> rustyline::Result<()> {
@@ -47,18 +46,15 @@ fn main() -> rustyline::Result<()> {
         eprintln!("ERROR: No previous history.");
         std::process::exit(1);
     }
-    let transport = if args.unix { connect::Transport::UNIX }
-                               else if args.udp { connect::Transport::UDP }
-                               else { connect::Transport::TCP };
-    let mut conn = connect::Conn::create();
-    let setting = connect::Setting {
-        addr: if args.unix { args.host }
-              else { format!("{}:{}", args.host, args.port) },
-        rqid: args.req_id,
-        time: args.timeout,
-        prot: transport
+    let transport = if args.unix {
+        connect::Transport::UNIX(args.host, Default::default())
+    } else if args.udp {
+        connect::Transport::UDP(format!("{}:{}", args.host, args.port), Default::default())
+    } else {
+        connect::Transport::TCP(format!("{}:{}", args.host, args.port), Default::default())
     };
-    conn.connect(setting);
+    let mut conn = connect::Conn::default();
+    conn.connect(transport, args.req_id, args.timeout);
     loop {
         let readline = rl.readline("");
         match readline {
