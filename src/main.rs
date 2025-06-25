@@ -46,22 +46,23 @@ fn main() -> rustyline::Result<()> {
         eprintln!("ERROR: No previous history.");
         std::process::exit(1);
     }
-    let transport = if args.unix {
+
+    let mut transport = if args.unix {
         connect::Transport::UNIX(args.host, Default::default())
     } else if args.udp {
         connect::Transport::UDP(format!("{}:{}", args.host, args.port), Default::default())
     } else {
         connect::Transport::TCP(format!("{}:{}", args.host, args.port), Default::default())
     };
-    let mut conn = connect::Conn::default();
-    conn.connect(transport, args.req_id, args.timeout);
+
+    transport.setting(args.req_id, args.timeout);
     loop {
         let readline = rl.readline("");
         match readline {
             Ok(line) => {
                 let _ = rl.add_history_entry(line.as_str());
                 if line == "quit" { break }
-                conn.write(line);
+                transport.write(line);
             },
             Err(ReadlineError::Interrupted) => { break },
             Err(ReadlineError::Eof) => { thread::sleep(timeout); break },

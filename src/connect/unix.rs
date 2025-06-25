@@ -1,5 +1,5 @@
 use std::thread;
-use std::io::BufReader;
+use std::io::{BufReader, ErrorKind};
 use std::io::prelude::*;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -10,29 +10,36 @@ pub struct UnixClient {
     addr: Option<String>,
     conn: Option<UnixStream>,
     hand: Option<JoinHandle<()>>,
-    down: bool
+    runn: bool
 }
 
 impl UnixClient {
     pub fn connect(&mut self, address: &str) {
-        self.addr = Some(address.to_string());
-        self.down = false;
+        if !self.conn.is_none() { drop(self.conn.take().unwrap()); } /* TODO */
+        else { self.addr = Some(address.to_string()) }
+        self.runn = false;
         match UnixStream::connect(self.addr.as_mut().unwrap()) {
             Ok(sock) => {
                 self.hand = self.activate_reader(sock.try_clone().unwrap());
                 self.conn = Some(sock);
+                self.runn = true;
             },
             Err(err) => {
                 eprintln!("ERROR: {}", err);
-                std::process::exit(1);
+                if err.kind() != ErrorKind::ConnectionRefused {
+                    std::process::exit(1);
+                }
             }
         };
     }
 
-    pub fn write(&mut self, line: String) {
-        match self.conn.as_mut().unwrap().write(line.as_bytes()) {
-            Err(err) => eprintln!("ERROR: {}", err),
-            _ => ()
+    pub fn write(&mut self, line: String) -> bool {
+        return match self.conn.as_mut() {
+            None => true,
+            Some(conn) => matches!(
+                conn.write(line.as_bytes()),
+                Err(ref err) if err.kind() == ErrorKind::BrokenPipe
+            ),
         };
     }
 
@@ -55,7 +62,7 @@ impl UnixClient {
 
 impl Drop for UnixClient {
     fn drop(&mut self) {
-        if !self.down {
+        if self.runn {
             self.conn.as_mut().unwrap().shutdown(Shutdown::Write).unwrap();
             self.hand.take().unwrap().join().unwrap();
         }

@@ -43,7 +43,8 @@ impl UdpClient {
         }
     }
 
-    pub fn write(&mut self, line: String) {
+    pub fn write(&mut self, line: String) -> bool {
+        if self.addr.is_none() { return true }
         let msg = if self.sync { self.split_message(line) }
                       else { self.build_header(line) };
         let mut buf = [0; MTU];
@@ -66,7 +67,7 @@ impl UdpClient {
             let mut hdr = self.parse_header(&buf[0..8]);
             if hdr[0] as u16 != self.rqid {
                 eprintln!("ERROR: Invalid header");
-                return;
+                return false;
             }
             let mut data: Vec<Vec<u8>> = vec![vec![]; hdr[2]];
             buf[8..].clone_into(data[hdr[1]].as_mut());
@@ -77,7 +78,7 @@ impl UdpClient {
                         hdr = self.parse_header(&buf[0..8]);
                         if hdr[0] as u16 != self.rqid {
                             eprintln!("ERROR: Invalid header");
-                            return;
+                            return false;
                         }
                         buf[8..].clone_into(data[hdr[1]].as_mut());
                     }
@@ -93,6 +94,7 @@ impl UdpClient {
                 Ok(msg) => print!("{}", msg)
             };
         }
+        return false;
     }
 
     fn parse_header(&mut self, head: &[u8]) -> [usize; 4] {

@@ -6,50 +6,33 @@ use self::tcp::TcpClient;
 use self::udp::UdpClient;
 use self::unix::UnixClient;
 
-#[derive(Default)]
 pub enum Transport {
-    #[default]
-    NONE,
     TCP(String, TcpClient),
     UDP(String, UdpClient),
     UNIX(String, UnixClient)
 }
 
-
-#[derive(Default)]
-pub struct Conn {
-    transport: Transport,
-}
-
-impl Conn {
-    pub fn connect(&mut self, transport: Transport, rqid: u16, time: u64) {
-        self.transport = transport;
-
-        match &mut self.transport {
-            Transport::TCP(addr, clnt) => {
-                clnt.connect(addr);
-            },
-            Transport::UDP(addr, clnt) => {
+impl Transport {
+    pub fn setting(&mut self, rqid: u16, time: u64) {
+        match self {
+            Transport::UDP(_, clnt) => {
                 clnt.rqid = rqid;
                 clnt.time = time;
-                clnt.connect(addr);
             },
-            Transport::UNIX(addr, clnt) => {
-                clnt.connect(addr);
-            },
-            _ => {}
+            _ => ()
         }
     }
-
     pub fn write(&mut self, line: String) {
         let mut buf = line;
         if buf.len() > 0 && &buf[buf.len() - 1..] != "\r" { buf.push('\r'); }
         buf.push('\n');
-        match &mut self.transport {
-            Transport::TCP(_, clnt) => clnt.write(buf),
-            Transport::UDP(_, clnt) => clnt.write(buf),
-            Transport::UNIX(_, clnt) => clnt.write(buf),
-            _ => ()
+        match self {
+            Transport::TCP(addr, clnt) =>
+                if clnt.write(buf) { clnt.connect(addr) },
+            Transport::UDP(addr, clnt) =>
+                if clnt.write(buf) { clnt.connect(addr) },
+            Transport::UNIX(addr, clnt) =>
+                if clnt.write(buf) { clnt.connect(addr) },
         }
     }
 }
