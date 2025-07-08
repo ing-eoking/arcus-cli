@@ -7,6 +7,8 @@ edition = "2021"
 clap = { version = "4.5.4", features = ["derive"] }
 rustyline = "14.0.0"
 rustyline-derive = "0.10.0"
+rsasl = "2.2.0"
+rpassword = "7.1"
 
 [features]
 with-file-history = []

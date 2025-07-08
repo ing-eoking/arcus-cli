@@ -11,6 +11,7 @@ pub struct UdpClient {
     addr: Option<SocketAddr>,
     conn: Option<UdpSocket>,
     sync: bool,
+    pub auth: bool,
 }
 
 impl UdpClient {

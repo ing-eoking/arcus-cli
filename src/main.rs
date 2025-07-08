@@ -32,7 +32,11 @@ struct Args {
 
     /// Timeout(μs)
     #[arg(short, long, default_value_t = 100)]
-    timeout: u64
+    timeout: u64,
+
+    /// Use Sasl
+    #[clap(long, action=ArgAction::SetTrue)]
+    sasl: bool,
 }
 
 fn main() -> rustyline::Result<()> {
@@ -55,7 +59,8 @@ fn main() -> rustyline::Result<()> {
         connect::Transport::TCP(format!("{}:{}", args.host, args.port), Default::default())
     };
 
-    transport.setting(args.req_id, args.timeout);
+    transport.setting(args.req_id, args.timeout, args.sasl);
+    transport.write("".to_string());
     loop {
         let readline = rl.readline("");
         match readline {
@@ -73,3 +78,4 @@ fn main() -> rustyline::Result<()> {
     rl.save_history("history.txt");
     Ok(())
 }
+

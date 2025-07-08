@@ -13,15 +13,22 @@ pub enum Transport {
 }
 
 impl Transport {
-    pub fn setting(&mut self, rqid: u16, time: u64) {
+    pub fn setting(&mut self, rqid: u16, time: u64, _auth: bool) {
         match self {
+            Transport::TCP(_, clnt) => {
+                clnt.auth = _auth;
+            }
             Transport::UDP(_, clnt) => {
                 clnt.rqid = rqid;
                 clnt.time = time;
+                clnt.auth = _auth;
             },
-            _ => ()
+            Transport::UNIX(_, clnt) => {
+                clnt.auth = _auth;
+            }
         }
     }
+
     pub fn write(&mut self, line: String) {
         let mut buf = line;
         if buf.len() > 0 && &buf[buf.len() - 1..] != "\r" { buf.push('\r'); }

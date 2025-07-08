@@ -1,15 +1,19 @@
 use std::thread;
-use std::io::{BufReader, ErrorKind};
+use std::io::{self, Write, BufReader, ErrorKind};
 use std::io::prelude::*;
 use std::net::{SocketAddr, TcpStream, Shutdown, ToSocketAddrs};
 use std::thread::JoinHandle;
+use rsasl::prelude::*;
+
+use std::sync::Arc;
 
 #[derive(Default)]
 pub struct TcpClient {
+    pub auth: bool,
     addr: Option<SocketAddr>,
     conn: Option<TcpStream>,
     hand: Option<JoinHandle<()>>,
-    runn: bool
+    runn: bool,
 }
 
 impl TcpClient {
@@ -35,9 +39,13 @@ impl TcpClient {
         for addr in addrs_iter {
             match TcpStream::connect(addr) {
                 Ok(stream) => {
-                    self.hand = self.activate_reader(stream.try_clone().unwrap());
-                    self.conn = Some(stream);
+                    self.conn = Some(stream.try_clone().unwrap());
                     self.addr = Some(addr); /* No need */
+                    if self.auth {
+                        self.authenticate();
+                    }
+
+                    self.hand = self.activate_reader(stream);
                     self.runn = true;
                     return;
                 },
@@ -60,6 +68,58 @@ impl TcpClient {
                 Err(ref err) if err.kind() == ErrorKind::BrokenPipe
             ),
         };
+    }
+
+    pub fn read(&mut self) -> String {
+        let mut line = String::new();
+        match self.conn.as_mut() {
+            None => eprintln!("ERROR: No connection"),
+            Some(conn) => {
+                let mut rbuf = BufReader::new(conn);
+                match rbuf.read_line(&mut line) {
+                    Err(e) => eprintln!("ERROR: {}", e),
+                    _ => ()
+                }
+            }
+        }
+        return line;
+    }
+
+    fn authenticate(&mut self) {
+        let mut username = String::new();
+
+        print!("username: ");
+        io::stdout().flush().unwrap();
+        io::stdin().read_line(&mut username).unwrap();
+        let username = username.trim();
+        let password = rpassword::prompt_password("password: ").unwrap();
+
+        let config = SASLConfig::with_credentials(None, username.to_string(), password).unwrap();
+
+        let sasl = SASLClient::new(config.clone());
+
+
+        // let creds = Credentials::default()
+        //                         .with_username(username)
+        //                         .with_password(password);
+
+        self.write("sasl mech\r\n".to_string());
+        let line = self.read();
+
+        if !line.starts_with("SASL_MECH ") {
+            eprintln!("ERROR: SASL_MECH error");
+        }
+
+        let mech = &line["SASL_MECH ".len()..line.len() - "\r\n".len()];
+        let server_mechs: Vec<&str> = mech.strip_prefix("SASL_MECH ")
+                                          .unwrap_or("")
+                                          .trim_end_matches("\r\n")
+                                          .split_whitespace()
+                                          .collect();
+
+
+        println!("<RES {:?}", mech);
+
     }
 
     fn activate_reader(&mut self, sock: TcpStream) -> Option<JoinHandle<()>> {

@@ -10,7 +10,8 @@ pub struct UnixClient {
     addr: Option<String>,
     conn: Option<UnixStream>,
     hand: Option<JoinHandle<()>>,
-    runn: bool
+    runn: bool,
+    pub auth: bool
 }
 
 impl UnixClient {
@@ -41,6 +42,21 @@ impl UnixClient {
                 Err(ref err) if err.kind() == ErrorKind::BrokenPipe
             ),
         };
+    }
+
+    pub fn read(&mut self) -> String {
+        let mut line = String::new();
+        match self.conn.as_mut() {
+            None => eprintln!("ERROR: No connection"),
+            Some(conn) => {
+                let mut rbuf = BufReader::new(conn);
+                match rbuf.read_line(&mut line) {
+                    Err(e) => eprintln!("ERROR: {}", e),
+                    _ => ()
+                }
+            }
+        }
+        return line;
     }
 
     fn activate_reader(&mut self, sock: UnixStream) -> Option<JoinHandle<()>> {
