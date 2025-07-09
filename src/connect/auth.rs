@@ -15,38 +15,53 @@ pub fn authenticate() {
                                          .with_username(username)
                                          .with_password(password);
 }
+use rsasl::prelude::*;
+use rsasl::mechanisms::Mechname;
+use std::sync::Arc;
 
-fn main() {
-    // 내 자격 증명 설정
-    let creds = StaticCredentialProvider::new("alice", "wonderland", None);
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 서버에서 받은 메커니즘 리스트 (예: "PLAIN SCRAM-SHA-256")
+    let mech_str = "PLAIN SCRAM-SHA-256";
+    let offered: Vec<Mechname> = mech_str
+        .split_whitespace()
+        .filter_map(|s| Mechname::parse(s.as_bytes()).ok())
+        .collect();
 
-    // 1. 서버로부터 메커니즘 리스트를 받음
-    let server_mechs = get_server_mechanisms();
+    let config = Arc::new(
+        SASLConfig::builder()
+            .user("alice")
+            .password("secret123")
+            .build()
+    );
 
-    // 2. 우선순위 기반으로 지원되는 메커니즘 선택
-    let preferred_order = ["SCRAM-SHA-256", "SCRAM-SHA-1", "PLAIN"];
+    let client = SASLClient::new(config);
+    let mut session = client
+        .start_suggested(&offered)
+        .expect("서버와 공유 가능한 메커니즘 없음");
 
-    let mech = preferred_order
-        .iter()
-        .find(|m| server_mechs.iter().any(|s| s == *m))
-        .expect("No supported mechanism found");
+    println!("선택된 메커니즘: {}", session.get_mechname());
 
-    println!("Using mechanism: {}", mech);
+    let mut outgoing: Option<Vec<u8>> = None;
 
-    // 3. 세션 생성
-    let mut session = ClientSession::new(mech, creds.clone())
-        .expect("Failed to create SASL session");
+    // StreamOverChannel 없이 step loop 예제
+    loop {
+        let state = if outgoing.is_some() {
+            session.step(outgoing.as_deref(), &mut std::io::sink())?
+        } else {
+            session.step(outgoing.as_deref(), &mut std::io::sink())?
+        };
 
-    // 4. 서버에 보낼 초기 메시지 생성
-    if let Some(msg) = session.initial_message() {
-        println!("Initial message: {}", base64::encode(&msg));
-        // 서버에 base64로 인코딩된 메시지를 보냅니다
+        if !state.is_running() {
+            println!("인증 완료 ({}", state.is_finish_success());
+            break;
+        }
+
+        outgoing = Some(session.get_last_msg().into());
+        println!("클라이언트 메시지 → 서버: {:?}", outgoing.as_ref().unwrap());
+        // 실제론 서버 응답을 네트워크로부터 읽어와야 함
+        // 예: outgoing = Some(received_bytes);
     }
 
-    // 5. 서버의 챌린지를 받았다고 가정하고 처리
-    let server_challenge = b"..."; // <- 서버에서 받은 바이트들
-
-    // (실제로는 네트워크 통해 받음)
-    // let response = session.handle_challenge(&server_challenge).unwrap();
-    // println!("Response to challenge: {:?}", base64::encode(&response));
+    Ok(())
 }

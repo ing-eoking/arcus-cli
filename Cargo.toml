@@ -7,7 +7,7 @@ edition = "2021"
 clap = { version = "4.5.4", features = ["derive"] }
 rustyline = "14.0.0"
 rustyline-derive = "0.10.0"
-rsasl = "2.2.0"
+rsasl = { version = "2.2.0", features = ["provider"], default-features = true }
 rpassword = "7.1"
 
 [features]
