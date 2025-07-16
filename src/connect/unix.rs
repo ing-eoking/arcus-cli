@@ -1,28 +1,30 @@
 use std::thread;
-use std::io::{BufReader, ErrorKind};
+use std::io::{self, BufReader, ErrorKind};
 use std::io::prelude::*;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::thread::JoinHandle;
+use rsasl::prelude::*;
 
 #[derive(Default)]
 pub struct UnixClient {
-    addr: Option<String>,
+    pub auth: bool,
     conn: Option<UnixStream>,
     hand: Option<JoinHandle<()>>,
     runn: bool,
-    pub auth: bool
 }
 
 impl UnixClient {
     pub fn connect(&mut self, address: &str) {
-        if !self.conn.is_none() { drop(self.conn.take().unwrap()); } /* TODO */
-        else { self.addr = Some(address.to_string()) }
+        if !self.conn.is_none() { drop(self.conn.take().unwrap()); }
         self.runn = false;
-        match UnixStream::connect(self.addr.as_mut().unwrap()) {
+        match UnixStream::connect(address) {
             Ok(sock) => {
-                self.hand = self.activate_reader(sock.try_clone().unwrap());
-                self.conn = Some(sock);
+                self.conn = Some(sock.try_clone().unwrap());
+                if self.auth {
+                    self.authenticate(sock.try_clone().unwrap());
+                }
+                self.hand = self.activate_reader(sock);
                 self.runn = true;
             },
             Err(err) => {
@@ -44,17 +46,11 @@ impl UnixClient {
         };
     }
 
-    pub fn read(&mut self) -> String {
+    fn read_line(&mut self, rbuf: &mut BufReader<UnixStream>) -> String {
         let mut line = String::new();
-        match self.conn.as_mut() {
-            None => eprintln!("ERROR: No connection"),
-            Some(conn) => {
-                let mut rbuf = BufReader::new(conn);
-                match rbuf.read_line(&mut line) {
-                    Err(e) => eprintln!("ERROR: {}", e),
-                    _ => ()
-                }
-            }
+        match rbuf.read_line(&mut line) {
+            Err(e) => eprintln!("ERROR: {}", e),
+            _ => ()
         }
         return line;
     }
@@ -73,6 +69,84 @@ impl UnixClient {
                 line.clear();
             }
         }));
+    }
+
+    fn authenticate(&mut self, conn: UnixStream) {
+        let mut rbuf = BufReader::new(conn);
+        let mut username = String::new();
+        print!("username: ");
+        io::stdout().flush().unwrap();
+        io::stdin().read_line(&mut username).unwrap();
+        let username = username.trim().to_string();
+        let password = rpassword::prompt_password("password: ").unwrap();
+
+        let config = SASLConfig::with_credentials(None, username, password).unwrap();
+        let client = SASLClient::new(config);
+
+        self.write("sasl mech\r\n".to_string());
+        let mut line = self.read_line(&mut rbuf);
+
+        if !line.starts_with("SASL_MECH ") {
+            eprintln!("AUTH_ERROR: Protocol error");
+            return;
+        }
+
+        let mech_list: &str = &line["SASL_MECH ".len()..line.len() - "\r\n".len()];
+        let server_mech: Vec<&Mechname> = mech_list.split_whitespace()
+                                                   .filter_map(|s| Mechname::parse(s.as_bytes()).ok())
+                                                   .collect();
+        let mut session = match client.start_suggested(&server_mech) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("AUTH_ERROR: {}", e);
+                return;
+            }
+        };
+
+        let mut mech = Some(session.get_mechname().to_string() + " ");
+        let mut resp: Option<Vec<u8>> = None;
+        loop {
+            let mut out = Vec::new();
+            let state = match session.step(resp.as_deref(), &mut out) {
+                Ok(res) => res,
+                Err(e) => {
+                    eprintln!("AUTH_ERROR: {}", e);
+                    break;
+                }
+            };
+
+            if !state.is_running() {
+                if state.is_finished() {
+                } else {
+                    eprintln!("AUTH_ERROR: SASL not finished");
+                    break;
+                }
+            }
+
+            let out_str = match std::str::from_utf8(&out) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("ERROR: {}", e);
+                    break;
+                }
+            };
+
+            let req = format!("sasl auth {}{}\r\n{}\r\n", mech.clone().unwrap_or("".to_string()),
+                                                                   out_str.len(), out_str);
+            self.write(req);
+            match self.read_line(&mut rbuf).as_str() {
+                s if s.starts_with("SASL_CONTINUE") => {
+                    line = self.read_line(&mut rbuf);
+                    resp = Some(line.strip_suffix("\r\n").unwrap_or(&line).as_bytes().to_vec());
+                    mech = None;
+                },
+                "SASL_OK\r\n" => break,
+                _ => {
+                    eprintln!("AUTH_ERROR: SASL authenticate failed");
+                    break;
+                }
+            }
+        }
     }
 }
 

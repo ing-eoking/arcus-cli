@@ -1,14 +1,13 @@
 use std::thread;
 use std::io::{self, Write, BufReader, ErrorKind};
 use std::io::prelude::*;
-use std::net::{SocketAddr, TcpStream, Shutdown, ToSocketAddrs};
+use std::net::{TcpStream, Shutdown, ToSocketAddrs};
 use std::thread::JoinHandle;
 use rsasl::prelude::*;
 
 #[derive(Default)]
 pub struct TcpClient {
     pub auth: bool,
-    addr: Option<SocketAddr>,
     conn: Option<TcpStream>,
     hand: Option<JoinHandle<()>>,
     runn: bool,
@@ -16,21 +15,14 @@ pub struct TcpClient {
 
 impl TcpClient {
     pub fn connect(&mut self, address: &str) {
-        if !self.conn.is_none() { /* TODO */
-            drop(self.conn.take().unwrap());
-            self.addr = None;
-        }
+        if !self.conn.is_none() { drop(self.conn.take().unwrap()); }
         self.runn = false;
-        let addrs_iter = if self.addr.is_none() {
-            match address.to_socket_addrs() {
-                Ok(addrs) => addrs.collect::<Vec<_>>(),
-                Err(err) => {
-                    eprintln!("ERROR: {}", err);
-                    std::process::exit(1);
-                }
+        let addrs_iter = match address.to_socket_addrs() {
+            Ok(addrs) => addrs.collect::<Vec<_>>(),
+            Err(err) => {
+                eprintln!("ERROR: {}", err);
+                std::process::exit(1);
             }
-        } else {
-            vec![self.addr.unwrap()]
         };
 
         let mut last_err = None;
@@ -38,7 +30,6 @@ impl TcpClient {
             match TcpStream::connect(addr) {
                 Ok(stream) => {
                     self.conn = Some(stream.try_clone().unwrap());
-                    self.addr = Some(addr); /* No need */
                     if self.auth {
                         self.authenticate(stream.try_clone().unwrap());
                     }
@@ -93,24 +84,30 @@ impl TcpClient {
         let mut line = self.read_line(&mut rbuf);
 
         if !line.starts_with("SASL_MECH ") {
-            eprintln!("ERROR: SASL_MECH error");
+            eprintln!("AUTH_ERROR: Protocol error");
+            return;
         }
 
         let mech_list: &str = &line["SASL_MECH ".len()..line.len() - "\r\n".len()];
         let server_mech: Vec<&Mechname> = mech_list.split_whitespace()
                                                    .filter_map(|s| Mechname::parse(s.as_bytes()).ok())
                                                    .collect();
-        let mut session = client.start_suggested(&server_mech)
-                                         .expect("ERROR: No mechanisms available");
+        let mut session = match client.start_suggested(&server_mech) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("AUTH_ERROR: {}", e);
+                return;
+            }
+        };
 
-        let mut mech = Some(session.get_mechname().to_string());
+        let mut mech = Some(session.get_mechname().to_string() + " ");
         let mut resp: Option<Vec<u8>> = None;
         loop {
             let mut out = Vec::new();
             let state = match session.step(resp.as_deref(), &mut out) {
                 Ok(res) => res,
                 Err(e) => {
-                    eprintln!("ERROR: {}", e);
+                    eprintln!("AUTH_ERROR: {}", e);
                     break;
                 }
             };
@@ -118,7 +115,7 @@ impl TcpClient {
             if !state.is_running() {
                 if state.is_finished() {
                 } else {
-                    eprintln!("ERROR: SASL authenticate failed");
+                    eprintln!("AUTH_ERROR: SASL not finished");
                     break;
                 }
             }
@@ -131,22 +128,22 @@ impl TcpClient {
                 }
             };
 
-            let req = format!("sasl auth {} {}\r\n{}\r\n", mech.clone().unwrap_or("".to_string()),
+            let req = format!("sasl auth {}{}\r\n{}\r\n", mech.clone().unwrap_or("".to_string()),
                                                                    out_str.len(), out_str);
             self.write(req);
-            line = self.read_line(&mut rbuf);
-            if line.starts_with("SASL_CONTINUE") {
-                line = self.read_line(&mut rbuf);
-                resp = Some(line.strip_suffix("\r\n").unwrap_or(&line).as_bytes().to_vec());
-            } else if line == "SASL_OK" {
-                break;
-            } else {
-                eprintln!("ERROR: SASL authenticate failed");
-                break;
+            match self.read_line(&mut rbuf).as_str() {
+                s if s.starts_with("SASL_CONTINUE") => {
+                    line = self.read_line(&mut rbuf);
+                    resp = Some(line.strip_suffix("\r\n").unwrap_or(&line).as_bytes().to_vec());
+                    mech = None;
+                },
+                "SASL_OK\r\n" => break,
+                _ => {
+                    eprintln!("AUTH_ERROR: SASL authenticate failed");
+                    break;
+                }
             }
-            mech = None;
         }
-
     }
 
     fn activate_reader(&mut self, sock: TcpStream) -> Option<JoinHandle<()>> {

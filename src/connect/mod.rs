@@ -29,17 +29,16 @@ impl Transport {
         }
     }
 
-    pub fn write(&mut self, line: String) {
-        let mut buf = line;
-        if buf.len() > 0 && &buf[buf.len() - 1..] != "\r" { buf.push('\r'); }
-        buf.push('\n');
+    pub fn write(&mut self, mut line: String) {
+        if !line.is_empty() && !line.ends_with('\r') { line.push('\r'); }
+        line.push('\n');
         match self {
             Transport::TCP(addr, clnt) =>
-                if clnt.write(buf) { clnt.connect(addr) },
+                if clnt.write(line) { clnt.connect(addr) },
             Transport::UDP(addr, clnt) =>
-                if clnt.write(buf) { clnt.connect(addr) },
+                if clnt.write(line) { clnt.connect(addr) },
             Transport::UNIX(addr, clnt) =>
-                if clnt.write(buf) { clnt.connect(addr) },
+                if clnt.write(line) { clnt.connect(addr) },
         }
     }
 }
