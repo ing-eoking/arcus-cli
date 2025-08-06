@@ -34,7 +34,7 @@ struct Args {
     #[arg(short, long, default_value_t = 100)]
     timeout: u64,
 
-    /// Use Sasl
+    /// Authenticate with sasl
     #[clap(long, action=ArgAction::SetTrue)]
     sasl: bool,
 }

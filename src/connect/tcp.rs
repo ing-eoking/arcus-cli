@@ -129,7 +129,7 @@ impl TcpClient {
             };
 
             let req = format!("sasl auth {}{}\r\n{}\r\n", mech.clone().unwrap_or("".to_string()),
-                                                                   out_str.len(), out_str);
+                                                                  out_str.len(), out_str);
             self.write(req);
             match self.read_line(&mut rbuf).as_str() {
                 s if s.starts_with("SASL_CONTINUE") => {
@@ -166,8 +166,12 @@ impl TcpClient {
 impl Drop for TcpClient {
     fn drop(&mut self) {
         if self.runn {
-            self.conn.as_mut().unwrap().shutdown(Shutdown::Write).unwrap();
-            self.hand.take().unwrap().join().unwrap();
+            if let Some(conn) = self.conn.as_mut() {
+                let _ = conn.shutdown(Shutdown::Write);
+            }
+            if let Some(handle) = self.hand.take() {
+                let _ = handle.join();
+            }
         }
     }
 }
