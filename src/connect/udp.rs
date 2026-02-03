@@ -1,137 +1,150 @@
-use std::io;
-use std::time::Duration;
+use std::io::{self, ErrorKind};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::time::Duration;
+use super::Connection;
 
 const MTU: usize = 1400;
+const HEADER_SIZE: usize = 8;
 
 #[derive(Default)]
 pub struct UdpClient {
     pub rqid: u16,
     pub time: u64,
+    pub auth: bool,
     addr: Option<SocketAddr>,
     conn: Option<UdpSocket>,
     sync: bool,
-    pub auth: bool,
+}
+
+impl Connection for UdpClient {
+    fn connect(&mut self, address: &str) -> io::Result<()> {
+        let addr = address.to_socket_addrs()?
+            .next()
+            .ok_or_else(|| io::Error::new(ErrorKind::AddrNotAvailable, "No address found"))?;
+
+        self.addr = Some(addr);
+
+        let sock = UdpSocket::bind("0.0.0.0:0")?;
+
+        if self.time > 0 {
+            let timeout = Duration::from_millis(self.time);
+            sock.set_read_timeout(Some(timeout))?;
+            sock.set_write_timeout(Some(timeout))?;
+        }
+
+        self.conn = Some(sock);
+        Ok(())
+    }
+
+    fn write(&mut self, line: String) -> io::Result<()> {
+        let sock = self.conn.as_ref()
+            .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "UDP socket not initialized"))?;
+        let addr = self.addr
+            .ok_or_else(|| io::Error::new(ErrorKind::AddrNotAvailable, "UDP target address not set"))?;
+
+        let msgs = if self.sync {
+            self.split_message(&line)
+        } else {
+            self.build_header(&line)
+        };
+
+        let mut buf = [0u8; MTU];
+
+        for msg in msgs {
+            sock.send_to(&msg, addr)?;
+
+            match sock.recv_from(&mut buf) {
+                Ok(_) => {
+                    self.sync = false;
+                }
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                    self.sync = !self.sync;
+                    return Err(io::Error::new(ErrorKind::TimedOut, "UDP Receive Timeout"));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        if !self.sync {
+            if self.reassemble_response(sock, &buf) {
+                Ok(())
+            } else {
+                Err(io::Error::new(ErrorKind::InvalidData, "Invalid UDP fragmented response"))
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    fn close(&mut self) {
+        self.conn = None;
+    }
 }
 
 impl UdpClient {
-    pub fn connect(&mut self, address: &str) {
-        let addrs_iter = match address.to_socket_addrs() {
-            Ok(addrs) => addrs.collect::<Vec<_>>(),
-            Err(err) => {
-                eprintln!("ERROR: {}", err);
-                std::process::exit(1);
-            }
-        };
-
-        let timeout = Some(Duration::from_millis(self.time));
-        match UdpSocket::bind("127.0.0.1:0") {
-            Ok(sock) => {
-                match sock.set_read_timeout(timeout) {
-                    Err(err) => {
-                        eprintln!("ERROR: {}", err);
-                        std::process::exit(1);
-                    }
-                    _ => ()
-                }
-                self.conn = Some(sock);
-            }
-            Err(err) => eprintln!("ERROR: {}", err)
-        };
-        for addr in addrs_iter {
-            self.addr = Some(addr);
-            break; /* TODO */
-        }
-    }
-
-    pub fn write(&mut self, line: String) -> bool {
-        if self.addr.is_none() { return true }
-        let msg = if self.sync { self.split_message(line) }
-                      else { self.build_header(line) };
-        let mut buf = [0; MTU];
-        for m in msg {
-            match self.conn.as_mut().unwrap().send_to(&m, self.addr.unwrap()) {
-                Err(err) => { eprintln!("ERROR: {}", err); break; }
-                _ => ()
-            }
-            match self.conn.as_mut().unwrap().recv_from(&mut buf) {
-                Err(err) => {
-                    if err.kind() == io::ErrorKind::WouldBlock {
-                        self.sync = !self.sync;
-                    }
-                    else { eprintln!("ERROR: {}", err); break; }
-                }
-                _ => { self.sync = false; break; }
-            }
-        }
-        if !self.sync {
-            let mut hdr = self.parse_header(&buf[0..8]);
-            if hdr[0] as u16 != self.rqid {
-                eprintln!("ERROR: Invalid header");
-                return false;
-            }
-            let mut data: Vec<Vec<u8>> = vec![vec![]; hdr[2]];
-            buf[8..].clone_into(data[hdr[1]].as_mut());
-            for _ in 1..hdr[2] {
-                buf = [0; MTU];
-                match self.conn.as_mut().unwrap().recv_from(&mut buf) {
-                    Ok(_) => {
-                        hdr = self.parse_header(&buf[0..8]);
-                        if hdr[0] as u16 != self.rqid {
-                            eprintln!("ERROR: Invalid header");
-                            return false;
-                        }
-                        buf[8..].clone_into(data[hdr[1]].as_mut());
-                    }
-                    _ => ()
-                }
-            }
-            let flat: Vec<u8> = data.iter()
-                                    .flat_map(|arr| arr.iter())
-                                    .cloned()
-                                    .collect();
-            match String::from_utf8(flat) {
-                Err(err) => eprintln!("ERROR: {}", err),
-                Ok(msg) => print!("{}", msg)
-            };
-        }
-        return false;
-    }
-
-    fn parse_header(&mut self, head: &[u8]) -> [usize; 4] {
-        let mut cvt: [usize; 4] = [0; 4];
-        cvt[0] = 255 * head[0] as usize + head[1] as usize;
-        cvt[1] = 255 * head[2] as usize + head[3] as usize;
-        cvt[2] = 255 * head[4] as usize + head[5] as usize;
-        return cvt;
-    }
-
-    fn build_header(&mut self, line: String) -> Vec<Vec<u8>> {
+    fn build_header(&self, line: &str) -> Vec<Vec<u8>> {
+        let payload_size = MTU - HEADER_SIZE;
+        let line_bytes = line.as_bytes();
+        let split_count = (line_bytes.len() + payload_size - 1) / payload_size;
         let mut ret = Vec::new();
-        let mut buffer: [u8; 8] = [0; 8];
-        let split = (line.len() + (MTU - 1)) / MTU;
-        buffer[0] = (self.rqid / 255) as u8;
-        buffer[1] = (self.rqid % 255) as u8;
-        buffer[4] = (split / 255) as u8;
-        buffer[5] = (split % 255) as u8;
-        for i in 0..split {
-            buffer[2] = (i / 255) as u8;
-            buffer[3] = (i % 255) as u8;
-            let last = if (i + 1) * MTU > line.len() { line.len() }
-                       else { (i + 1) * MTU };
-            ret.push([&buffer, line[i*MTU..last].as_bytes()].concat());
+
+        for i in 0..split_count {
+            let start = i * payload_size;
+            let end = std::cmp::min(start + payload_size, line_bytes.len());
+
+            let mut packet = vec![0u8; HEADER_SIZE];
+            packet[0] = (self.rqid / 256) as u8;
+            packet[1] = (self.rqid % 256) as u8;
+            packet[2] = (i / 256) as u8;
+            packet[3] = (i % 256) as u8;
+            packet[4] = (split_count / 256) as u8;
+            packet[5] = (split_count % 256) as u8;
+            packet.extend_from_slice(&line_bytes[start..end]);
+            ret.push(packet);
         }
-        return ret;
+        ret
     }
 
-    fn split_message(&mut self, line: String) -> Vec<Vec<u8>> {
-        let mut ret = Vec::new();
-        let split = (line.len() + (MTU - 1)) / MTU;
-        for i in 0..split {
-            let last = if (i + 1) * MTU > line.len() { line.len() }
-                       else { (i + 1) * MTU };
-            ret.push(line[i*MTU..last].as_bytes().to_vec());
+    fn split_message(&self, line: &str) -> Vec<Vec<u8>> {
+        line.as_bytes()
+            .chunks(MTU)
+            .map(|chunk| chunk.to_vec())
+            .collect()
+    }
+
+    fn reassemble_response(&self, sock: &UdpSocket, first_pkt: &[u8]) -> bool {
+        if first_pkt.len() < HEADER_SIZE { return false; }
+
+        let total = (256 * first_pkt[4] as usize) + first_pkt[5] as usize;
+        let mut buckets = vec![Vec::new(); total];
+
+        let seq = (256 * first_pkt[2] as usize) + first_pkt[3] as usize;
+        if seq < total {
+            buckets[seq] = first_pkt[HEADER_SIZE..].to_vec();
         }
-        return ret;
+
+        let mut buf = [0u8; MTU];
+        for _ in 1..total {
+             if let Ok((size, _)) = sock.recv_from(&mut buf) {
+                 let s = (256 * buf[2] as usize) + buf[3] as usize;
+                 if s < total {
+                     buckets[s] = buf[HEADER_SIZE..size].to_vec();
+                 }
+             } else {
+                 return false;
+             }
+        }
+
+        let flat_data: Vec<u8> = buckets.into_iter().flatten().collect();
+        match String::from_utf8(flat_data) {
+            Ok(s) => {
+                print!("{}", s);
+                true
+            },
+            Err(_) => {
+                eprintln!("ERROR: Received non-UTF8 UDP response");
+                false
+            }
+        }
     }
 }

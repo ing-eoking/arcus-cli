@@ -6,6 +6,7 @@ use rustyline::history::DefaultHistory;
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
 use clap::{ArgAction, Parser};
+use connect::Transport;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -51,16 +52,25 @@ fn main() -> rustyline::Result<()> {
         std::process::exit(1);
     }
 
-    let mut transport = if args.unix {
-        connect::Transport::UNIX(args.host, Default::default())
-    } else if args.udp {
-        connect::Transport::UDP(format!("{}:{}", args.host, args.port), Default::default())
+    let builder = Transport::builder()
+        .rqid(args.req_id)
+        .time(args.timeout)
+        .auth(args.sasl);
+
+    let addr = if args.unix {
+        args.host
     } else {
-        connect::Transport::TCP(format!("{}:{}", args.host, args.port), Default::default())
+        format!("{}:{}", args.host, args.port)
     };
 
-    transport.setting(args.req_id, args.timeout, args.sasl);
-    transport.write("".to_string());
+    let mut transport = if args.unix {
+        builder.build_unix(addr)
+    } else if args.udp {
+        builder.build_udp(addr)
+    } else {
+        builder.build_tcp(addr)
+    };
+
     loop {
         let readline = rl.readline("");
         match readline {
