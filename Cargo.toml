@@ -1,10 +1,10 @@
 [package]
 name = "arcus-cli"
-version = "0.1.0"
-edition = "2021"
+version = "1.0.0"
+edition = "2024"
 
 [dependencies]
-clap = { version = "4.5.56", features = ["derive"] }
+clap = { version = "4.5.57", features = ["derive"] }
 rustyline = "17.0.2"
 rustyline-derive = "0.11.1"
 rsasl = { version = "2.2.0", features = ["provider", "config_builder"], default-features = false }
