@@ -234,7 +234,10 @@ impl Highlighter for MyHelper {
 impl Validator for MyHelper {
     fn validate(&self, ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
         let input = ctx.input();
-        if input.contains('\n') { return Ok(ValidationResult::Valid(None)); }
+
+        if input.contains('\n') {
+            return Ok(ValidationResult::Valid(None));
+        }
 
         if let Some((hint, _)) = self.find_best_hint(input) {
             let hint_first_line = hint.display.split('\n').next().unwrap_or("");
@@ -242,12 +245,14 @@ impl Validator for MyHelper {
             let input_parts = input.split_whitespace().count();
 
             if input_parts < required_parts {
-                return Ok(ValidationResult::Incomplete);
+                return Ok(ValidationResult::Valid(None));
             }
+
             if hint.display.contains('\n') {
                 return Ok(ValidationResult::Incomplete);
             }
         }
+
         Ok(ValidationResult::Valid(None))
     }
 }
@@ -350,7 +355,7 @@ pub fn arcus_hints() -> Vec<CMDHint> {
         ("bop incr <key> <bkey> <delta> [<initial> [<eflag>]] [noreply|pipe]", "bop incr"),
         ("bop decr <key> <bkey> <delta> [<initial> [<eflag>]] [noreply|pipe]", "bop decr"),
         ("bop mget <lenkeys> <numkeys> <bkey|bkey_range> [<fwhere> [<bitwop> <foperand>] <compop> <fvalue>] [<offset>] <count>\n<space_separated_keys>", "bop mget"),
-        ("bop smget <lenkeys> <numkeys> <bkey|bkey range> [<fwhere> [<bitwop> <foperand>] <compop> <fvalue>] <count> [duplicate|unique]\n<space_separated_keys>", "bop smget"),
+        ("bop smget <lenkeys> <numkeys> <bkey|bkey_range> [<fwhere> [<bitwop> <foperand>] <compop> <fvalue>] <count> [duplicate|unique]\n<space_separated_keys>", "bop smget"),
         ("bop position <key> <bkey> <asc|desc>", "bop position"),
         ("bop pwg <key> <bkey> <asc|desc> [<count>]", "bop pwg"),
         ("bop gbp <key> <order> <position|position_range>\n", "bop gbp"),
