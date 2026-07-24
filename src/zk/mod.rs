@@ -72,6 +72,34 @@ fn parse_ls(args: &[&str]) -> ZkCommand {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub enum CompletionTarget {
+    Command { start: usize, prefix: String },
+    Path { start: usize, parent: String, prefix: String },
+    None,
+}
+
+pub fn completion_target(line: &str, pos: usize) -> CompletionTarget {
+    let head = &line[..pos];
+    let tok_start = head.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+    let tok = &head[tok_start..];
+
+    let before_tok = &head[..tok_start];
+    if before_tok.trim().is_empty() {
+        return CompletionTarget::Command { start: tok_start, prefix: tok.to_string() };
+    }
+
+    if !tok.starts_with('/') {
+        return CompletionTarget::None;
+    }
+
+    let slash = tok.rfind('/').unwrap();
+    let prefix = tok[slash + 1..].to_string();
+    let parent = if slash == 0 { "/".to_string() } else { tok[..slash].to_string() };
+    let start = tok_start + slash + 1;
+    CompletionTarget::Path { start, parent, prefix }
+}
+
 fn join_zk_path(parent: &str, child: &str) -> String {
     if parent == "/" {
         format!("/{}", child)
@@ -316,5 +344,62 @@ mod tests {
         assert_eq!(join_zk_path("/", "arcus"), "/arcus");
         assert_eq!(join_zk_path("/arcus", "cache_list"), "/arcus/cache_list");
         assert_eq!(join_zk_path("/a/b", "c"), "/a/b/c");
+    }
+
+    #[test]
+    fn completion_first_token_is_command() {
+        match completion_target("l", 1) {
+            CompletionTarget::Command { start, prefix } => { assert_eq!(start, 0); assert_eq!(prefix, "l"); }
+            _ => panic!("expected Command"),
+        }
+    }
+
+    #[test]
+    fn completion_empty_line_is_command_all() {
+        match completion_target("", 0) {
+            CompletionTarget::Command { start, prefix } => { assert_eq!(start, 0); assert_eq!(prefix, ""); }
+            _ => panic!("expected Command"),
+        }
+    }
+
+    #[test]
+    fn completion_path_at_root() {
+        match completion_target("ls /arc", 7) {
+            CompletionTarget::Path { start, parent, prefix } => {
+                assert_eq!(start, 4);          // just after the leading '/'
+                assert_eq!(parent, "/");
+                assert_eq!(prefix, "arc");
+            }
+            _ => panic!("expected Path"),
+        }
+    }
+
+    #[test]
+    fn completion_path_trailing_slash() {
+        match completion_target("get /arcus/", 11) {
+            CompletionTarget::Path { start, parent, prefix } => {
+                assert_eq!(start, 11);
+                assert_eq!(parent, "/arcus");
+                assert_eq!(prefix, "");
+            }
+            _ => panic!("expected Path"),
+        }
+    }
+
+    #[test]
+    fn completion_path_nested_prefix() {
+        match completion_target("get /arcus/ca", 13) {
+            CompletionTarget::Path { start, parent, prefix } => {
+                assert_eq!(start, 11);
+                assert_eq!(parent, "/arcus");
+                assert_eq!(prefix, "ca");
+            }
+            _ => panic!("expected Path"),
+        }
+    }
+
+    #[test]
+    fn completion_non_path_arg_is_none() {
+        assert!(matches!(completion_target("get foo", 7), CompletionTarget::None));
     }
 }
