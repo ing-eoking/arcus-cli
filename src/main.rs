@@ -50,6 +50,12 @@ fn main() -> rustyline::Result<()> {
     let default_port = if args.zookeeper { 2181 } else { 11211 };
     let port = args.port.unwrap_or(default_port);
     let timeout = time::Duration::from_micros(args.timeout);
+
+    if args.zookeeper {
+        let addr = format!("{}:{}", args.host, port);
+        return zk::run_repl(&addr, timeout);
+    }
+
     let h = helper::MyHelper::new();
     let mut rl: Editor<helper::MyHelper, DefaultHistory> = Editor::new()?;
     rl.set_helper(Some(h));
@@ -69,10 +75,6 @@ fn main() -> rustyline::Result<()> {
     } else {
         format!("{}:{}", args.host, port)
     };
-
-    if args.zookeeper {
-        return zk::run_repl(&addr, timeout);
-    }
 
     let mut transport = if args.unix {
         builder.build_unix(addr)
