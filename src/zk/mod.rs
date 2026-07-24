@@ -5,7 +5,7 @@ use zookeeper::{ZooKeeper, Acl, CreateMode, WatchedEvent};
 
 #[derive(Debug)]
 pub enum ZkCommand {
-    Ls(String),
+    Ls { path: String, recursive: bool, stat: bool },
     Get(String),
     Create(String, Vec<u8>),
     Set(String, Vec<u8>),
@@ -27,7 +27,7 @@ pub fn parse(line: &str) -> ZkCommand {
     let args = &tokens[1..];
 
     match verb {
-        "ls" if args.len() == 1 => ZkCommand::Ls(args[0].to_string()),
+        "ls" => parse_ls(args),
         "get" if args.len() == 1 => ZkCommand::Get(args[0].to_string()),
         "delete" if args.len() == 1 => ZkCommand::Delete(args[0].to_string()),
         "stat" if args.len() == 1 => ZkCommand::Stat(args[0].to_string()),
@@ -40,10 +40,35 @@ pub fn parse(line: &str) -> ZkCommand {
             ZkCommand::Set(args[0].to_string(), data)
         }
         "quit" => ZkCommand::Quit,
-        "ls" | "get" | "delete" | "stat" | "create" | "set" => {
+        "get" | "delete" | "stat" | "create" | "set" => {
             ZkCommand::Unknown(format!("usage: {} requires a path (and data for set)", verb))
         }
         other => ZkCommand::Unknown(other.to_string()),
+    }
+}
+
+fn parse_ls(args: &[&str]) -> ZkCommand {
+    let mut recursive = false;
+    let mut stat = false;
+    let mut path: Option<&str> = None;
+    for tok in args {
+        match *tok {
+            "-R" => recursive = true,
+            "-s" => stat = true,
+            t if t.starts_with('-') => {
+                return ZkCommand::Unknown(format!("ls: unknown flag {}", t));
+            }
+            t => {
+                if path.is_some() {
+                    return ZkCommand::Unknown("usage: ls [-R] [-s] <path>".to_string());
+                }
+                path = Some(t);
+            }
+        }
+    }
+    match path {
+        Some(p) => ZkCommand::Ls { path: p.to_string(), recursive, stat },
+        None => ZkCommand::Unknown("usage: ls [-R] [-s] <path>".to_string()),
     }
 }
 
@@ -66,7 +91,7 @@ impl ZkClient {
             ZkCommand::Quit => return true,
             ZkCommand::Empty => {}
             ZkCommand::Unknown(msg) => eprintln!("ERROR: {}", msg),
-            ZkCommand::Ls(path) => match self.zk.get_children(&path, false) {
+            ZkCommand::Ls { path, recursive: _, stat: _ } => match self.zk.get_children(&path, false) {
                 Ok(children) => println!("[{}]", children.join(", ")),
                 Err(e) => eprintln!("ERROR: {:?}", e),
             },
@@ -149,18 +174,63 @@ mod tests {
     }
 
     #[test]
-    fn ls_takes_a_path() {
-        assert!(matches!(parse("ls /arcus"), ZkCommand::Ls(p) if p == "/arcus"));
+    fn ls_plain_has_no_flags() {
+        match parse("ls /arcus") {
+            ZkCommand::Ls { path, recursive, stat } => {
+                assert_eq!(path, "/arcus"); assert!(!recursive); assert!(!stat);
+            }
+            _ => panic!("expected Ls"),
+        }
+    }
+
+    #[test]
+    fn ls_recursive_flag() {
+        match parse("ls -R /arcus") {
+            ZkCommand::Ls { path, recursive, stat } => {
+                assert_eq!(path, "/arcus"); assert!(recursive); assert!(!stat);
+            }
+            _ => panic!("expected Ls"),
+        }
+    }
+
+    #[test]
+    fn ls_stat_flag() {
+        match parse("ls -s /arcus") {
+            ZkCommand::Ls { path, recursive, stat } => {
+                assert_eq!(path, "/arcus"); assert!(!recursive); assert!(stat);
+            }
+            _ => panic!("expected Ls"),
+        }
+    }
+
+    #[test]
+    fn ls_both_flags_any_order() {
+        for line in ["ls -R -s /a", "ls -s -R /a", "ls /a -R -s", "ls -R /a -s"] {
+            match parse(line) {
+                ZkCommand::Ls { path, recursive, stat } => {
+                    assert_eq!(path, "/a", "line: {line}");
+                    assert!(recursive, "line: {line}");
+                    assert!(stat, "line: {line}");
+                }
+                _ => panic!("expected Ls for {line}"),
+            }
+        }
     }
 
     #[test]
     fn ls_without_path_is_unknown() {
         assert!(matches!(parse("ls"), ZkCommand::Unknown(_)));
+        assert!(matches!(parse("ls -R"), ZkCommand::Unknown(_)));
     }
 
     #[test]
-    fn ls_with_extra_args_is_unknown() {
+    fn ls_with_two_paths_is_unknown() {
         assert!(matches!(parse("ls /a /b"), ZkCommand::Unknown(_)));
+    }
+
+    #[test]
+    fn ls_with_unknown_flag_is_unknown() {
+        assert!(matches!(parse("ls -x /a"), ZkCommand::Unknown(_)));
     }
 
     #[test]
