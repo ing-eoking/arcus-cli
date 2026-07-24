@@ -5,7 +5,10 @@ use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline_derive::{Helper, Hinter, Highlighter, Validator};
-use zookeeper::{ZooKeeper, Acl, CreateMode, WatchedEvent};
+use zookeeper::{ZooKeeper, Acl, CreateMode, WatchedEvent, ZkError};
+use std::num::NonZeroU32;
+use base64::{engine::general_purpose::STANDARD, Engine};
+use ring::{digest, hmac, pbkdf2};
 
 #[derive(Debug)]
 pub enum ZkCommand {
@@ -15,6 +18,7 @@ pub enum ZkCommand {
     Set(String, Vec<u8>),
     Delete(String),
     Stat(String),
+    Password { path: String, password: String },
     Quit,
     Empty,
     Unknown(String),
@@ -43,9 +47,15 @@ pub fn parse(line: &str) -> ZkCommand {
             let data = args[1..].join(" ").into_bytes();
             ZkCommand::Set(args[0].to_string(), data)
         }
+        "password" if args.len() >= 2 => {
+            ZkCommand::Password { path: args[0].to_string(), password: args[1..].join(" ") }
+        }
         "quit" => ZkCommand::Quit,
         "get" | "delete" | "stat" | "create" | "set" => {
             ZkCommand::Unknown(format!("usage: {} requires a path (and data for set)", verb))
+        }
+        "password" => {
+            ZkCommand::Unknown("usage: password <path> <password>".to_string())
         }
         other => ZkCommand::Unknown(other.to_string()),
     }
@@ -112,7 +122,41 @@ fn join_zk_path(parent: &str, child: &str) -> String {
     }
 }
 
-const CMDS: [&str; 7] = ["ls", "get", "create", "set", "delete", "stat", "quit"];
+const SCRAM_ITERATIONS: u32 = 4096;
+const SCRAM_SALT_LEN: usize = 16;
+
+/// Build a `SCRAM-SHA-256$<iters>:<salt>$<storedKey>:<serverKey>` secret string
+/// for the given password and salt. Deterministic for a fixed salt.
+fn scram_sha256_with_salt(password: &str, salt: &[u8]) -> String {
+    let mut salted = [0u8; digest::SHA256_OUTPUT_LEN];
+    pbkdf2::derive(
+        pbkdf2::PBKDF2_HMAC_SHA256,
+        NonZeroU32::new(SCRAM_ITERATIONS).unwrap(),
+        salt,
+        password.as_bytes(),
+        &mut salted,
+    );
+    let client_key = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &salted), b"Client Key");
+    let stored_key = digest::digest(&digest::SHA256, client_key.as_ref());
+    let server_key = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &salted), b"Server Key");
+    format!(
+        "SCRAM-SHA-256${}:{}${}:{}",
+        SCRAM_ITERATIONS,
+        STANDARD.encode(salt),
+        STANDARD.encode(stored_key.as_ref()),
+        STANDARD.encode(server_key.as_ref()),
+    )
+}
+
+/// Same as [`scram_sha256_with_salt`] but generates a fresh random salt.
+fn scram_sha256(password: &str) -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut salt = [0u8; SCRAM_SALT_LEN];
+    SystemRandom::new().fill(&mut salt).expect("secure RNG failure");
+    scram_sha256_with_salt(password, &salt)
+}
+
+const CMDS: [&str; 8] = ["ls", "get", "create", "set", "delete", "stat", "password", "quit"];
 
 struct ZkClient {
     zk: Rc<ZooKeeper>,
@@ -195,6 +239,18 @@ impl ZkClient {
                 Ok(None) => eprintln!("ERROR: no such node: {}", path),
                 Err(e) => eprintln!("ERROR: {:?}", e),
             },
+            ZkCommand::Password { path, password } => {
+                let node = join_zk_path(&path, "authPassword");
+                let secret = scram_sha256(&password).into_bytes();
+                match self.zk.create(&node, secret.clone(), Acl::open_unsafe().clone(), CreateMode::Persistent) {
+                    Ok(created) => println!("Created {}", created),
+                    Err(ZkError::NodeExists) => match self.zk.set_data(&node, secret, None) {
+                        Ok(stat) => println!("Updated {} (version: {})", node, stat.version),
+                        Err(e) => eprintln!("ERROR: {:?}", e),
+                    },
+                    Err(e) => eprintln!("ERROR: {:?}", e),
+                }
+            }
         }
         false
     }
@@ -387,6 +443,45 @@ mod tests {
         assert_eq!(join_zk_path("/", "arcus"), "/arcus");
         assert_eq!(join_zk_path("/arcus", "cache_list"), "/arcus/cache_list");
         assert_eq!(join_zk_path("/a/b", "c"), "/a/b/c");
+    }
+
+    #[test]
+    fn password_parses_path_and_rest_as_password() {
+        match parse("password /arcus my secret pw") {
+            ZkCommand::Password { path, password } => {
+                assert_eq!(path, "/arcus");
+                assert_eq!(password, "my secret pw");
+            }
+            _ => panic!("expected Password"),
+        }
+    }
+
+    #[test]
+    fn password_without_password_is_unknown() {
+        assert!(matches!(parse("password /arcus"), ZkCommand::Unknown(_)));
+        assert!(matches!(parse("password"), ZkCommand::Unknown(_)));
+    }
+
+    #[test]
+    fn scram_known_answer_vector() {
+        // Fixed salt 0x00..0x0f, password "s3cr3t pass" — computed with ring/PBKDF2-HMAC-SHA256.
+        let salt: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let got = scram_sha256_with_salt("s3cr3t pass", &salt);
+        assert_eq!(
+            got,
+            "SCRAM-SHA-256$4096:AAECAwQFBgcICQoLDA0ODw==$6i4jOYWHJLrlFTKu5W87IjT8NVpgIkNQ7VAST+aQ7/4=:G+t+F5dZwvqO6+i1VjhX1O1t+IVP0hfOOJBKm//WPcs="
+        );
+    }
+
+    #[test]
+    fn scram_random_salt_has_expected_shape() {
+        let s = scram_sha256("hunter2");
+        assert!(s.starts_with("SCRAM-SHA-256$4096:"));
+        // "SCRAM-SHA-256$<iters>:<salt>$<stored>:<server>"
+        let (_prefix, rest) = s.split_once('$').unwrap();
+        let parts: Vec<&str> = rest.split('$').collect();
+        assert_eq!(parts.len(), 2, "expected one iters:salt and one stored:server section");
+        assert!(parts[0].contains(':') && parts[1].contains(':'));
     }
 
     #[test]
