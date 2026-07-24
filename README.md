@@ -33,9 +33,10 @@ cargo run -- --unix --host /tmp/arcus.sock
 cargo run -- --zookeeper --host 127.0.0.1 --port 2181
 ```
 
-In ZooKeeper mode the REPL supports: `ls <path>`, `get <path>`,
-`create <path> [data]`, `set <path> <data>`, `delete <path>`, `stat <path>`,
-and `quit`.
+In ZooKeeper mode the REPL supports: `ls [-R] [-s] <path>` (`-R` recursive,
+`-s` with stat), `get <path>`, `create <path> [data]`, `set <path> <data>`,
+`delete <path>`, `stat <path>`, and `quit`. Press Tab to complete command
+names and existing znode paths at the current path.
 
 ## Installation
 
