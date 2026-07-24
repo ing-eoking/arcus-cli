@@ -4,11 +4,11 @@ version = "1.0.0"
 edition = "2024"
 
 [dependencies]
-clap = { version = "4.5.57", features = ["derive"] }
-rustyline = "17.0.2"
-rustyline-derive = "0.11.1"
-rsasl = { version = "2.2.0", features = ["provider", "config_builder"], default-features = false }
-rpassword = "7.1"
+clap = { version = "4.6.4", features = ["derive"] }
+rustyline = "18.0.1"
+rustyline-derive = "0.12.0"
+rsasl = { version = "2.3.1", features = ["provider", "config_builder","scram-sha-2"], default-features = false }
+rpassword = "7.5.4"
 
 [features]
 with-file-history = []
