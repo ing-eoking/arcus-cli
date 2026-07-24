@@ -1,3 +1,8 @@
+use std::time::Duration;
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
+use zookeeper::{ZooKeeper, Acl, CreateMode, WatchedEvent};
+
 #[derive(Debug)]
 pub enum ZkCommand {
     Ls(String),
@@ -40,6 +45,97 @@ pub fn parse(line: &str) -> ZkCommand {
         }
         other => ZkCommand::Unknown(other.to_string()),
     }
+}
+
+struct ZkClient {
+    zk: ZooKeeper,
+}
+
+impl ZkClient {
+    fn connect(addr: &str, timeout: Duration) -> zookeeper::ZkResult<ZkClient> {
+        let zk = ZooKeeper::connect(addr, timeout, |ev: WatchedEvent| {
+            eprintln!("WATCHER: {:?} state={:?} path={:?}",
+                      ev.event_type, ev.keeper_state, ev.path);
+        })?;
+        Ok(ZkClient { zk })
+    }
+
+    /// Runs one command. Returns true when the loop should exit.
+    fn execute(&self, cmd: ZkCommand) -> bool {
+        match cmd {
+            ZkCommand::Quit => return true,
+            ZkCommand::Empty => {}
+            ZkCommand::Unknown(msg) => eprintln!("ERROR: {}", msg),
+            ZkCommand::Ls(path) => match self.zk.get_children(&path, false) {
+                Ok(children) => println!("[{}]", children.join(", ")),
+                Err(e) => eprintln!("ERROR: {:?}", e),
+            },
+            ZkCommand::Get(path) => match self.zk.get_data(&path, false) {
+                Ok((data, _stat)) => println!("{}", String::from_utf8_lossy(&data)),
+                Err(e) => eprintln!("ERROR: {:?}", e),
+            },
+            ZkCommand::Create(path, data) => {
+                match self.zk.create(&path, data, Acl::open_unsafe().clone(), CreateMode::Persistent) {
+                    Ok(created) => println!("Created {}", created),
+                    Err(e) => eprintln!("ERROR: {:?}", e),
+                }
+            }
+            ZkCommand::Set(path, data) => match self.zk.set_data(&path, data, None) {
+                Ok(stat) => println!("version: {}", stat.version),
+                Err(e) => eprintln!("ERROR: {:?}", e),
+            },
+            ZkCommand::Delete(path) => match self.zk.delete(&path, None) {
+                Ok(()) => println!("Deleted {}", path),
+                Err(e) => eprintln!("ERROR: {:?}", e),
+            },
+            ZkCommand::Stat(path) => match self.zk.exists(&path, false) {
+                Ok(Some(stat)) => {
+                    println!("czxid: {}", stat.czxid);
+                    println!("mzxid: {}", stat.mzxid);
+                    println!("ctime: {}", stat.ctime);
+                    println!("mtime: {}", stat.mtime);
+                    println!("version: {}", stat.version);
+                    println!("cversion: {}", stat.cversion);
+                    println!("aversion: {}", stat.aversion);
+                    println!("ephemeralOwner: {}", stat.ephemeral_owner);
+                    println!("dataLength: {}", stat.data_length);
+                    println!("numChildren: {}", stat.num_children);
+                    println!("pzxid: {}", stat.pzxid);
+                }
+                Ok(None) => eprintln!("ERROR: no such node: {}", path),
+                Err(e) => eprintln!("ERROR: {:?}", e),
+            },
+        }
+        false
+    }
+}
+
+pub fn run_repl(addr: &str, timeout: Duration) -> rustyline::Result<()> {
+    let client = match ZkClient::connect(addr, timeout) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ERROR: Failed to connect to ZooKeeper at {}: {:?}", addr, e);
+            std::process::exit(1);
+        }
+    };
+
+    // Fresh editor: no helper (no memcached hints), no history load/save.
+    let mut rl = DefaultEditor::new()?;
+    loop {
+        match rl.readline("") {
+            Ok(line) => {
+                if client.execute(parse(&line)) {
+                    break;
+                }
+            }
+            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
+            Err(err) => {
+                eprintln!("ERROR: {:?}", err);
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
