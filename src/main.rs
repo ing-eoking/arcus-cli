@@ -16,9 +16,13 @@ struct Args {
     #[arg(long, default_value_t = String::from("127.0.0.1"))]
     host: String,
 
-    /// Port Number
-    #[arg(short, long, default_value_t = 11211)]
-    port: u16,
+    /// Port Number (default: 11211, or 2181 in --zookeeper mode)
+    #[arg(short, long)]
+    port: Option<u16>,
+
+    /// Connect to a ZooKeeper ensemble (zkCli-like), disables memcached mode
+    #[clap(long, action=ArgAction::SetTrue)]
+    zookeeper: bool,
 
     /// Use UDP protocol
     #[clap(long, action=ArgAction::SetTrue)]
@@ -43,6 +47,8 @@ struct Args {
 
 fn main() -> rustyline::Result<()> {
     let args = Args::parse();
+    let default_port = if args.zookeeper { 2181 } else { 11211 };
+    let port = args.port.unwrap_or(default_port);
     let timeout = time::Duration::from_micros(args.timeout);
     let h = helper::MyHelper::new();
     let mut rl: Editor<helper::MyHelper, DefaultHistory> = Editor::new()?;
@@ -61,8 +67,12 @@ fn main() -> rustyline::Result<()> {
     let addr = if args.unix {
         args.host
     } else {
-        format!("{}:{}", args.host, args.port)
+        format!("{}:{}", args.host, port)
     };
+
+    if args.zookeeper {
+        return zk::run_repl(&addr, timeout);
+    }
 
     let mut transport = if args.unix {
         builder.build_unix(addr)

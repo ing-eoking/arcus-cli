@@ -10,6 +10,7 @@ It provides a seamless interactive experience for managing a standalone Arcus se
 - **SASL Authentication**
 - **Advanced REPL**
 - **Auto-Reconnection**
+- **ZooKeeper Mode (zkCli-like)**
 
 ## Execution
 
@@ -27,7 +28,14 @@ cargo run -- --host 127.0.0.1 --udp
 
 # Connect via Unix Domain Socket
 cargo run -- --unix --host /tmp/arcus.sock
+
+# Connect to a ZooKeeper ensemble (like zkCli); history is disabled
+cargo run -- --zookeeper --host 127.0.0.1 --port 2181
 ```
+
+In ZooKeeper mode the REPL supports: `ls <path>`, `get <path>`,
+`create <path> [data]`, `set <path> <data>`, `delete <path>`, `stat <path>`,
+and `quit`.
 
 ## Installation
 
