@@ -1,6 +1,10 @@
+use std::rc::Rc;
 use std::time::Duration;
-use rustyline::DefaultEditor;
+use rustyline::{Editor, Context};
+use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
+use rustyline::history::DefaultHistory;
+use rustyline_derive::{Helper, Hinter, Highlighter, Validator};
 use zookeeper::{ZooKeeper, Acl, CreateMode, WatchedEvent};
 
 #[derive(Debug)]
@@ -108,17 +112,15 @@ fn join_zk_path(parent: &str, child: &str) -> String {
     }
 }
 
+const CMDS: [&str; 7] = ["ls", "get", "create", "set", "delete", "stat", "quit"];
+
 struct ZkClient {
-    zk: ZooKeeper,
+    zk: Rc<ZooKeeper>,
 }
 
 impl ZkClient {
-    fn connect(addr: &str, timeout: Duration) -> zookeeper::ZkResult<ZkClient> {
-        let zk = ZooKeeper::connect(addr, timeout, |ev: WatchedEvent| {
-            eprintln!("WATCHER: {:?} state={:?} path={:?}",
-                      ev.event_type, ev.keeper_state, ev.path);
-        })?;
-        Ok(ZkClient { zk })
+    fn new(zk: Rc<ZooKeeper>) -> ZkClient {
+        ZkClient { zk }
     }
 
     fn print_stat(&self, stat: &zookeeper::Stat) {
@@ -198,17 +200,58 @@ impl ZkClient {
     }
 }
 
+#[derive(Helper, Hinter, Highlighter, Validator)]
+struct ZkHelper {
+    zk: Rc<ZooKeeper>,
+}
+
+impl Completer for ZkHelper {
+    type Candidate = Pair;
+
+    fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>)
+        -> rustyline::Result<(usize, Vec<Pair>)>
+    {
+        match completion_target(line, pos) {
+            CompletionTarget::Command { start, prefix } => {
+                let pairs = CMDS.iter()
+                    .filter(|c| c.starts_with(&prefix))
+                    .map(|c| Pair { display: c.to_string(), replacement: c.to_string() })
+                    .collect();
+                Ok((start, pairs))
+            }
+            CompletionTarget::Path { start, parent, prefix } => {
+                let pairs = match self.zk.get_children(&parent, false) {
+                    Ok(children) => children.into_iter()
+                        .filter(|name| name.starts_with(&prefix))
+                        .map(|name| Pair { display: name.clone(), replacement: name })
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+                Ok((start, pairs))
+            }
+            CompletionTarget::None => Ok((pos, Vec::new())),
+        }
+    }
+}
+
 pub fn run_repl(addr: &str, timeout: Duration) -> rustyline::Result<()> {
-    let client = match ZkClient::connect(addr, timeout) {
-        Ok(c) => c,
+    let zk = match ZooKeeper::connect(addr, timeout, |ev: WatchedEvent| {
+        eprintln!("WATCHER: {:?} state={:?} path={:?}",
+                  ev.event_type, ev.keeper_state, ev.path);
+    }) {
+        Ok(zk) => Rc::new(zk),
         Err(e) => {
             eprintln!("ERROR: Failed to connect to ZooKeeper at {}: {:?}", addr, e);
             std::process::exit(1);
         }
     };
 
-    // Fresh editor: no helper (no memcached hints), no history load/save.
-    let mut rl = DefaultEditor::new()?;
+    let client = ZkClient::new(Rc::clone(&zk));
+
+    // Editor with completion only: no history load/save, no hints.
+    let mut rl: Editor<ZkHelper, DefaultHistory> = Editor::new()?;
+    rl.set_helper(Some(ZkHelper { zk: Rc::clone(&zk) }));
+
     loop {
         match rl.readline("") {
             Ok(line) => {
