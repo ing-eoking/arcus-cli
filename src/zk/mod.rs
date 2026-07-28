@@ -5,7 +5,7 @@ use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline_derive::{Helper, Hinter, Highlighter, Validator};
-use zookeeper::{ZooKeeper, Acl, CreateMode, WatchedEvent, ZkError};
+use zookeeper::{ZooKeeper, Acl, Permission, CreateMode, WatchedEvent, ZkError, ZkResult};
 use std::num::NonZeroU32;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ring::{digest, hmac, pbkdf2};
@@ -19,6 +19,8 @@ pub enum ZkCommand {
     Delete(String),
     Stat(String),
     Password { path: String, password: String },
+    Setacl { path: String, id: String, password: String, perms: Permission },
+    Help,
     Quit,
     Empty,
     Unknown(String),
@@ -50,12 +52,33 @@ pub fn parse(line: &str) -> ZkCommand {
         "password" if args.len() >= 2 => {
             ZkCommand::Password { path: args[0].to_string(), password: args[1..].join(" ") }
         }
+        "setacl" if args.len() == 3 || args.len() == 4 => {
+            let perms = if args.len() == 4 {
+                match parse_perms(args[3]) {
+                    Some(p) => p,
+                    None => return ZkCommand::Unknown(
+                        format!("setacl: invalid perms '{}' (use letters from crwad)", args[3])),
+                }
+            } else {
+                Permission::ALL
+            };
+            ZkCommand::Setacl {
+                path: args[0].to_string(),
+                id: args[1].to_string(),
+                password: args[2].to_string(),
+                perms,
+            }
+        }
+        "help" => ZkCommand::Help,
         "quit" => ZkCommand::Quit,
         "get" | "delete" | "stat" | "create" | "set" => {
             ZkCommand::Unknown(format!("usage: {} requires a path (and data for set)", verb))
         }
         "password" => {
             ZkCommand::Unknown("usage: password <path> <password>".to_string())
+        }
+        "setacl" => {
+            ZkCommand::Unknown("usage: setacl <path> <id> <password> [perms(crwad)]".to_string())
         }
         other => ZkCommand::Unknown(other.to_string()),
     }
@@ -156,15 +179,94 @@ fn scram_sha256(password: &str) -> String {
     scram_sha256_with_salt(password, &salt)
 }
 
-const CMDS: [&str; 8] = ["ls", "get", "create", "set", "delete", "stat", "password", "quit"];
+/// ZooKeeper `digest` ACL id: `<user>:base64(sha1("user:password"))`.
+fn zk_digest_id(user: &str, password: &str) -> String {
+    let raw = format!("{}:{}", user, password);
+    let hash = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, raw.as_bytes());
+    format!("{}:{}", user, STANDARD.encode(hash.as_ref()))
+}
+
+/// Parse a permission string of `crwad` letters into a `Permission`.
+/// Returns None on an empty string or any unrecognized letter.
+fn parse_perms(s: &str) -> Option<Permission> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut perms = Permission::NONE;
+    for c in s.chars() {
+        perms = perms | match c {
+            'r' => Permission::READ,
+            'w' => Permission::WRITE,
+            'c' => Permission::CREATE,
+            'd' => Permission::DELETE,
+            'a' => Permission::ADMIN,
+            _ => return None,
+        };
+    }
+    Some(perms)
+}
+
+const CMDS: [&str; 10] = ["ls", "get", "create", "set", "delete", "stat", "password", "setacl", "help", "quit"];
+
+const HELP_TEXT: &str = "\
+Commands:
+  ls [-R] [-s] <path>            list children (-R recursive, -s with stat)
+  get <path>                     print node data
+  create <path> [data]           create a persistent node
+  set <path> <data>              set node data
+  delete <path>                  delete a node
+  stat <path>                    print node stat
+  password <path> <password>     store SCRAM-SHA-256 secret at <path>/authPassword
+  setacl <path> <id> <password> [perms]
+                                 set a digest ACL on <path> (perms: crwad, default all)
+  help                           show this help
+  quit                           exit
+Tab completes command names and existing znode paths.
+Protected nodes prompt for id/password and retry automatically.";
 
 struct ZkClient {
     zk: Rc<ZooKeeper>,
 }
 
+/// Prompt for a `digest` id/password on stdin (password hidden).
+/// Returns None if input could not be read.
+fn prompt_credentials() -> Option<(String, String)> {
+    use std::io::{self, Write};
+    let mut id = String::new();
+    print!("id: ");
+    io::stdout().flush().ok()?;
+    io::stdin().read_line(&mut id).ok()?;
+    let id = id.trim().to_string();
+    let password = rpassword::prompt_password("password: ").ok()?;
+    Some((id, password))
+}
+
 impl ZkClient {
     fn new(zk: Rc<ZooKeeper>) -> ZkClient {
         ZkClient { zk }
+    }
+
+    /// Run a ZK operation. If it fails with `NoAuth` (the node's ACL requires
+    /// authentication), prompt for a digest id/password, add it to the session,
+    /// and retry the operation exactly once.
+    fn with_auth_retry<T>(&self, mut op: impl FnMut() -> ZkResult<T>) -> ZkResult<T> {
+        match op() {
+            Err(ZkError::NoAuth) => {
+                eprintln!("Authentication required for this node.");
+                match prompt_credentials() {
+                    Some((id, pw)) => {
+                        let auth = format!("{}:{}", id, pw).into_bytes();
+                        if let Err(e) = self.zk.add_auth("digest", auth) {
+                            eprintln!("ERROR: add_auth failed: {:?}", e);
+                            return Err(ZkError::NoAuth);
+                        }
+                        op()
+                    }
+                    None => Err(ZkError::NoAuth),
+                }
+            }
+            other => other,
+        }
     }
 
     fn print_stat(&self, stat: &zookeeper::Stat) {
@@ -183,7 +285,7 @@ impl ZkClient {
 
     fn ls_recursive(&self, path: &str) {
         println!("{}", path);
-        match self.zk.get_children(path, false) {
+        match self.with_auth_retry(|| self.zk.get_children(path, false)) {
             Ok(children) => {
                 for child in children {
                     self.ls_recursive(&join_zk_path(path, &child));
@@ -197,44 +299,45 @@ impl ZkClient {
     fn execute(&self, cmd: ZkCommand) -> bool {
         match cmd {
             ZkCommand::Quit => return true,
+            ZkCommand::Help => println!("{}", HELP_TEXT),
             ZkCommand::Empty => {}
             ZkCommand::Unknown(msg) => eprintln!("ERROR: {}", msg),
             ZkCommand::Ls { path, recursive, stat } => {
                 if recursive {
                     self.ls_recursive(&path);
                 } else {
-                    match self.zk.get_children(&path, false) {
+                    match self.with_auth_retry(|| self.zk.get_children(&path, false)) {
                         Ok(children) => println!("[{}]", children.join(", ")),
                         Err(e) => eprintln!("ERROR: {:?}", e),
                     }
                 }
                 if stat {
-                    match self.zk.exists(&path, false) {
+                    match self.with_auth_retry(|| self.zk.exists(&path, false)) {
                         Ok(Some(s)) => self.print_stat(&s),
                         Ok(None) => eprintln!("ERROR: no such node: {}", path),
                         Err(e) => eprintln!("ERROR: {:?}", e),
                     }
                 }
             }
-            ZkCommand::Get(path) => match self.zk.get_data(&path, false) {
+            ZkCommand::Get(path) => match self.with_auth_retry(|| self.zk.get_data(&path, false)) {
                 Ok((data, _stat)) => println!("{}", String::from_utf8_lossy(&data)),
                 Err(e) => eprintln!("ERROR: {:?}", e),
             },
             ZkCommand::Create(path, data) => {
-                match self.zk.create(&path, data, Acl::open_unsafe().clone(), CreateMode::Persistent) {
+                match self.with_auth_retry(|| self.zk.create(&path, data.clone(), Acl::open_unsafe().clone(), CreateMode::Persistent)) {
                     Ok(created) => println!("Created {}", created),
                     Err(e) => eprintln!("ERROR: {:?}", e),
                 }
             }
-            ZkCommand::Set(path, data) => match self.zk.set_data(&path, data, None) {
+            ZkCommand::Set(path, data) => match self.with_auth_retry(|| self.zk.set_data(&path, data.clone(), None)) {
                 Ok(stat) => println!("version: {}", stat.version),
                 Err(e) => eprintln!("ERROR: {:?}", e),
             },
-            ZkCommand::Delete(path) => match self.zk.delete(&path, None) {
+            ZkCommand::Delete(path) => match self.with_auth_retry(|| self.zk.delete(&path, None)) {
                 Ok(()) => println!("Deleted {}", path),
                 Err(e) => eprintln!("ERROR: {:?}", e),
             },
-            ZkCommand::Stat(path) => match self.zk.exists(&path, false) {
+            ZkCommand::Stat(path) => match self.with_auth_retry(|| self.zk.exists(&path, false)) {
                 Ok(Some(stat)) => self.print_stat(&stat),
                 Ok(None) => eprintln!("ERROR: no such node: {}", path),
                 Err(e) => eprintln!("ERROR: {:?}", e),
@@ -242,13 +345,27 @@ impl ZkClient {
             ZkCommand::Password { path, password } => {
                 let node = join_zk_path(&path, "authPassword");
                 let secret = scram_sha256(&password).into_bytes();
-                match self.zk.create(&node, secret.clone(), Acl::open_unsafe().clone(), CreateMode::Persistent) {
+                match self.with_auth_retry(|| self.zk.create(&node, secret.clone(), Acl::open_unsafe().clone(), CreateMode::Persistent)) {
                     Ok(created) => println!("Created {}", created),
-                    Err(ZkError::NodeExists) => match self.zk.set_data(&node, secret, None) {
+                    Err(ZkError::NodeExists) => match self.with_auth_retry(|| self.zk.set_data(&node, secret.clone(), None)) {
                         Ok(stat) => println!("Updated {} (version: {})", node, stat.version),
                         Err(e) => eprintln!("ERROR: {:?}", e),
                     },
                     Err(e) => eprintln!("ERROR: {:?}", e),
+                }
+            }
+            ZkCommand::Setacl { path, id, password, perms } => {
+                // Authenticate the session with these credentials first, so setting
+                // the digest ACL does not lock this session out of the node.
+                let auth = format!("{}:{}", id, password).into_bytes();
+                if let Err(e) = self.zk.add_auth("digest", auth) {
+                    eprintln!("ERROR: add_auth failed: {:?}", e);
+                } else {
+                    let acl = vec![Acl::new(perms, "digest", zk_digest_id(&id, &password))];
+                    match self.with_auth_retry(|| self.zk.set_acl(&path, acl.clone(), None)) {
+                        Ok(stat) => println!("ACL set on {} (aversion: {})", path, stat.aversion),
+                        Err(e) => eprintln!("ERROR: {:?}", e),
+                    }
                 }
             }
         }
@@ -304,13 +421,15 @@ pub fn run_repl(addr: &str, timeout: Duration) -> rustyline::Result<()> {
 
     let client = ZkClient::new(Rc::clone(&zk));
 
-    // Editor with completion only: no history load/save, no hints.
+    // Editor with completion and in-session (memory-only) history: arrow keys
+    // recall previous commands, but nothing is loaded from or saved to a file.
     let mut rl: Editor<ZkHelper, DefaultHistory> = Editor::new()?;
     rl.set_helper(Some(ZkHelper { zk: Rc::clone(&zk) }));
 
     loop {
         match rl.readline("") {
             Ok(line) => {
+                let _ = rl.add_history_entry(line.as_str());
                 if client.execute(parse(&line)) {
                     break;
                 }
@@ -439,6 +558,12 @@ mod tests {
     }
 
     #[test]
+    fn help_parses() {
+        assert!(matches!(parse("help"), ZkCommand::Help));
+        assert!(matches!(parse("help extra args"), ZkCommand::Help));
+    }
+
+    #[test]
     fn join_zk_path_root_and_nested() {
         assert_eq!(join_zk_path("/", "arcus"), "/arcus");
         assert_eq!(join_zk_path("/arcus", "cache_list"), "/arcus/cache_list");
@@ -471,6 +596,42 @@ mod tests {
             got,
             "SCRAM-SHA-256$4096:AAECAwQFBgcICQoLDA0ODw==$6i4jOYWHJLrlFTKu5W87IjT8NVpgIkNQ7VAST+aQ7/4=:G+t+F5dZwvqO6+i1VjhX1O1t+IVP0hfOOJBKm//WPcs="
         );
+    }
+
+    #[test]
+    fn zk_digest_id_known_vector() {
+        // Matches zkCli `addauth digest testuser:testpw` -> id testuser:hgyMJAgPa/lE9gh8N+BYWysiXeA=
+        assert_eq!(zk_digest_id("testuser", "testpw"), "testuser:hgyMJAgPa/lE9gh8N+BYWysiXeA=");
+    }
+
+    #[test]
+    fn parse_perms_letters_all_and_invalid() {
+        assert_eq!(parse_perms("r"), Some(Permission::READ));
+        assert_eq!(parse_perms("rw"), Some(Permission::READ | Permission::WRITE));
+        assert_eq!(parse_perms("rwcda"), Some(Permission::ALL));
+        assert_eq!(parse_perms("x"), None);
+        assert_eq!(parse_perms(""), None);
+    }
+
+    #[test]
+    fn setacl_parse_default_and_explicit_perms() {
+        match parse("setacl /a user pw") {
+            ZkCommand::Setacl { path, id, password, perms } => {
+                assert_eq!(path, "/a"); assert_eq!(id, "user"); assert_eq!(password, "pw");
+                assert_eq!(perms, Permission::ALL);
+            }
+            _ => panic!("expected Setacl"),
+        }
+        match parse("setacl /a user pw rw") {
+            ZkCommand::Setacl { perms, .. } => assert_eq!(perms, Permission::READ | Permission::WRITE),
+            _ => panic!("expected Setacl"),
+        }
+    }
+
+    #[test]
+    fn setacl_bad_args_are_unknown() {
+        assert!(matches!(parse("setacl /a user"), ZkCommand::Unknown(_)));
+        assert!(matches!(parse("setacl /a user pw zzz"), ZkCommand::Unknown(_)));
     }
 
     #[test]
