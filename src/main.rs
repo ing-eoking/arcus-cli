@@ -1,8 +1,9 @@
 mod helper;
 mod connect;
+mod request;
 mod zk;
 
-use std::{thread, time};
+use std::time;
 use rustyline::history::DefaultHistory;
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
@@ -36,8 +37,8 @@ struct Args {
     #[arg(long, action=ArgAction::SetTrue)]
     unix: bool,
 
-    /// Timeout(μs)
-    #[arg(short, long, default_value_t = 100)]
+    /// Timeout(ms) to wait for responses (UDP replies, and pending replies on exit)
+    #[arg(short, long, default_value_t = 1000)]
     timeout: u64,
 
     /// Authenticate with sasl
@@ -49,7 +50,7 @@ fn main() -> rustyline::Result<()> {
     let args = Args::parse();
     let default_port = if args.zookeeper { 2181 } else { 11211 };
     let port = args.port.unwrap_or(default_port);
-    let timeout = time::Duration::from_micros(args.timeout);
+    let timeout = time::Duration::from_millis(args.timeout);
 
     if args.zookeeper {
         let addr = format!("{}:{}", args.host, port);
@@ -67,7 +68,7 @@ fn main() -> rustyline::Result<()> {
 
     let builder = Transport::builder()
         .rqid(args.req_id)
-        .time(args.timeout)
+        .wait(timeout)
         .auth(args.sasl);
 
     let addr = if args.unix {
@@ -84,21 +85,31 @@ fn main() -> rustyline::Result<()> {
         builder.build_tcp(addr)
     };
 
-    loop {
+    /* The helper's validator keeps reading lines (typed, pasted or piped)
+     * until every request has its data line(s), so each input is complete. */
+    'repl: loop {
         let readline = rl.readline("");
+        let continuing = rl.helper().is_some_and(|h| h.take_continuing());
         match readline {
-            Ok(line) => {
-                let _ = rl.add_history_entry(line.as_str());
-                if line == "quit" { break }
-                transport.write(line);
+            Ok(input) => {
+                if !input.trim().is_empty() {
+                    let _ = rl.add_history_entry(input.as_str());
+                }
+                for req in &request::split(&input).requests {
+                    let quit = req.command().split_whitespace().next() == Some("quit");
+                    if !(quit && args.udp) { transport.send(req); }
+                    if quit { break 'repl; }
+                }
             },
-            Err(ReadlineError::Interrupted) => { break },
-            Err(ReadlineError::Eof) => { thread::sleep(timeout); break },
+            /* Ctrl-C while data lines are awaited only cancels that input */
+            Err(ReadlineError::Interrupted) if continuing => continue,
+            Err(ReadlineError::Interrupted) => break,
+            Err(ReadlineError::Eof) => break,
             Err(err) => { eprintln!("ERROR: {:?}", err); break }
         }
     }
+    transport.finish();
     #[cfg(feature = "with-file-history")]
-    rl.save_history("history.txt");
+    let _ = rl.save_history("history.txt");
     Ok(())
 }
-

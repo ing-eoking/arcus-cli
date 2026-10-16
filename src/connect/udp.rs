@@ -1,150 +1,86 @@
-use std::io::{self, ErrorKind};
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::io::{self, ErrorKind, Write};
+use std::net::{ToSocketAddrs, UdpSocket};
 use std::time::Duration;
-use super::Connection;
 
-const MTU: usize = 1400;
 const HEADER_SIZE: usize = 8;
+/// memcached reads a UDP request into a single 64KB buffer and rejects
+/// multi-datagram requests, so one request must fit in one datagram.
+const MAX_REQUEST: usize = 65507 - HEADER_SIZE;
+const MAX_DATAGRAM: usize = 65535;
 
 #[derive(Default)]
 pub struct UdpClient {
     pub rqid: u16,
-    pub time: u64,
-    pub auth: bool,
-    addr: Option<SocketAddr>,
+    pub wait: Duration,
     conn: Option<UdpSocket>,
-    sync: bool,
 }
 
-impl Connection for UdpClient {
-    fn connect(&mut self, address: &str) -> io::Result<()> {
+impl UdpClient {
+    pub fn connect(&mut self, address: &str) -> io::Result<()> {
         let addr = address.to_socket_addrs()?
             .next()
             .ok_or_else(|| io::Error::new(ErrorKind::AddrNotAvailable, "No address found"))?;
-
-        self.addr = Some(addr);
-
-        let sock = UdpSocket::bind("0.0.0.0:0")?;
-
-        if self.time > 0 {
-            let timeout = Duration::from_millis(self.time);
-            sock.set_read_timeout(Some(timeout))?;
-            sock.set_write_timeout(Some(timeout))?;
-        }
-
+        let bind = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+        let sock = UdpSocket::bind(bind)?;
+        sock.connect(addr)?;
+        sock.set_read_timeout(Some(self.wait.max(Duration::from_millis(1))))?;
         self.conn = Some(sock);
         Ok(())
     }
 
-    fn write(&mut self, line: String) -> io::Result<()> {
+    /// Sends one request and prints its response. Requests with `noreply`
+    /// get no response, so nothing is awaited for them.
+    pub fn send(&mut self, data: &[u8], expect_reply: bool) -> io::Result<()> {
         let sock = self.conn.as_ref()
             .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "UDP socket not initialized"))?;
-        let addr = self.addr
-            .ok_or_else(|| io::Error::new(ErrorKind::AddrNotAvailable, "UDP target address not set"))?;
+        if data.len() > MAX_REQUEST {
+            return Err(io::Error::new(ErrorKind::InvalidInput,
+                format!("request of {} bytes exceeds a single UDP datagram", data.len())));
+        }
 
-        let msgs = if self.sync {
-            self.split_message(&line)
-        } else {
-            self.build_header(&line)
-        };
+        self.rqid = self.rqid.wrapping_add(1);
+        let rqid = self.rqid;
+        let mut packet = Vec::with_capacity(HEADER_SIZE + data.len());
+        packet.extend_from_slice(&rqid.to_be_bytes());
+        packet.extend_from_slice(&[0, 0, 0, 1, 0, 0]); /* seq 0 of 1 */
+        packet.extend_from_slice(data);
+        sock.send(&packet)?;
 
-        let mut buf = [0u8; MTU];
+        if !expect_reply { return Ok(()); }
+        let response = Self::receive(sock, rqid)?;
+        let mut out = io::stdout().lock();
+        out.write_all(&response)?;
+        out.flush()
+    }
 
-        for msg in msgs {
-            sock.send_to(&msg, addr)?;
+    fn receive(sock: &UdpSocket, rqid: u16) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; MAX_DATAGRAM];
+        let mut parts: Vec<Option<Vec<u8>>> = Vec::new();
 
-            match sock.recv_from(&mut buf) {
-                Ok(_) => {
-                    self.sync = false;
-                }
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
-                    self.sync = !self.sync;
-                    return Err(io::Error::new(ErrorKind::TimedOut, "UDP Receive Timeout"));
+        loop {
+            let n = match sock.recv(&mut buf) {
+                Ok(n) => n,
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    return Err(io::Error::new(ErrorKind::TimedOut, "UDP response timeout"));
                 }
                 Err(e) => return Err(e),
-            }
-        }
+            };
+            if n < HEADER_SIZE { continue; }
+            if u16::from_be_bytes([buf[0], buf[1]]) != rqid { continue; } /* stale response */
 
-        if !self.sync {
-            if self.reassemble_response(sock, &buf) {
-                Ok(())
-            } else {
-                Err(io::Error::new(ErrorKind::InvalidData, "Invalid UDP fragmented response"))
+            let seq = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+            let total = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+            if total == 0 || seq >= total { continue; }
+            if parts.len() != total { parts = vec![None; total]; }
+            parts[seq] = Some(buf[HEADER_SIZE..n].to_vec());
+
+            if parts.iter().all(Option::is_some) {
+                return Ok(parts.into_iter().flatten().flatten().collect());
             }
-        } else {
-            Ok(())
         }
     }
 
-    fn close(&mut self) {
+    pub fn close(&mut self) {
         self.conn = None;
-    }
-}
-
-impl UdpClient {
-    fn build_header(&self, line: &str) -> Vec<Vec<u8>> {
-        let payload_size = MTU - HEADER_SIZE;
-        let line_bytes = line.as_bytes();
-        let split_count = (line_bytes.len() + payload_size - 1) / payload_size;
-        let mut ret = Vec::new();
-
-        for i in 0..split_count {
-            let start = i * payload_size;
-            let end = std::cmp::min(start + payload_size, line_bytes.len());
-
-            let mut packet = vec![0u8; HEADER_SIZE];
-            packet[0] = (self.rqid / 256) as u8;
-            packet[1] = (self.rqid % 256) as u8;
-            packet[2] = (i / 256) as u8;
-            packet[3] = (i % 256) as u8;
-            packet[4] = (split_count / 256) as u8;
-            packet[5] = (split_count % 256) as u8;
-            packet.extend_from_slice(&line_bytes[start..end]);
-            ret.push(packet);
-        }
-        ret
-    }
-
-    fn split_message(&self, line: &str) -> Vec<Vec<u8>> {
-        line.as_bytes()
-            .chunks(MTU)
-            .map(|chunk| chunk.to_vec())
-            .collect()
-    }
-
-    fn reassemble_response(&self, sock: &UdpSocket, first_pkt: &[u8]) -> bool {
-        if first_pkt.len() < HEADER_SIZE { return false; }
-
-        let total = (256 * first_pkt[4] as usize) + first_pkt[5] as usize;
-        let mut buckets = vec![Vec::new(); total];
-
-        let seq = (256 * first_pkt[2] as usize) + first_pkt[3] as usize;
-        if seq < total {
-            buckets[seq] = first_pkt[HEADER_SIZE..].to_vec();
-        }
-
-        let mut buf = [0u8; MTU];
-        for _ in 1..total {
-             if let Ok((size, _)) = sock.recv_from(&mut buf) {
-                 let s = (256 * buf[2] as usize) + buf[3] as usize;
-                 if s < total {
-                     buckets[s] = buf[HEADER_SIZE..size].to_vec();
-                 }
-             } else {
-                 return false;
-             }
-        }
-
-        let flat_data: Vec<u8> = buckets.into_iter().flatten().collect();
-        match String::from_utf8(flat_data) {
-            Ok(s) => {
-                print!("{}", s);
-                true
-            },
-            Err(_) => {
-                eprintln!("ERROR: Received non-UTF8 UDP response");
-                false
-            }
-        }
     }
 }
