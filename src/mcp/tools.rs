@@ -22,6 +22,7 @@ pub fn registry() -> Vec<Box<dyn Tool>> {
         Box::new(ZkPassword),
         Box::new(ListFeatures),
         Box::new(CheckPrerequisites),
+        Box::new(JobStatusTool),
     ]
 }
 
@@ -235,6 +236,33 @@ impl Tool for CheckPrerequisites {
     }
 }
 
+struct JobStatusTool;
+impl Tool for JobStatusTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "arcus_job_status",
+            description: "Poll a background job (install, download, login) by id: state is running, succeeded or failed, \
+                with the current step, a message on failure, and the log file path.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {"id": {"type": "string", "description": "Job id returned by the tool that started it"}},
+                "required": ["id"]
+            }),
+        }
+    }
+    fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
+        let id = try_arg!(arg_str(args, "id"));
+        match crate::server::jobs::status(&ctx.home, &id) {
+            Ok(s) => {
+                let text = format!("job {} is {:?} (step: {}){}", s.id, s.state, s.step,
+                    if s.message.is_empty() { String::new() } else { format!(": {}", s.message) });
+                ToolResult::ok(text, serde_json::to_value(&s).ok())
+            }
+            Err(e) => ToolResult::err(format!("arcus_job_status failed: {e}")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +332,12 @@ mod tests {
         assert!(!r.is_error);
         let s = r.structured.unwrap();
         assert!(s["missing"].is_array() && s["hint"].is_string());
+    }
+
+    #[test]
+    fn job_status_tool_unknown_id_is_error() {
+        let t = registry().into_iter().find(|t| t.spec().name == "arcus_job_status").unwrap();
+        assert!(t.call(&ctx(), &json!({"id": "install-1"})).is_error);
+        assert!(t.call(&ctx(), &json!({})).is_error);
     }
 }
