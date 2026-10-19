@@ -76,6 +76,7 @@ fn handler(kind: JobKind) -> Option<Handler> {
     match kind {
         #[cfg(test)]
         JobKind::Test => Some(test_handler),
+        JobKind::Install => Some(super::build::install_job),
         JobKind::EeLogin => Some(super::release::ee_login_job),
         _ => None,
     }

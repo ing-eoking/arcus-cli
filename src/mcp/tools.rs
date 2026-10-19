@@ -26,6 +26,7 @@ pub fn registry() -> Vec<Box<dyn Tool>> {
         Box::new(JobStatusTool),
         Box::new(ListVersions),
         Box::new(EeLogin),
+        Box::new(Install),
     ]
 }
 
@@ -351,6 +352,84 @@ impl Tool for EeLogin {
     }
 }
 
+struct Install;
+impl Tool for Install {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "arcus_install",
+            description: "Build and install an ARCUS server from source as a background job. Returns job_id and build_key; \
+                poll arcus_job_status until it is succeeded (the build can take several minutes). Missing build tools are \
+                reported with an install command to show the user. EE needs a GitHub login (arcus_ee_login).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "edition": {"type": "string", "enum": ["public", "ee"], "description": "ARCUS edition"},
+                    "version": {"type": "string", "description": "Version to build (default: newest)"},
+                    "features": {"type": "array", "items": {"type": "string"},
+                        "description": "Feature names from arcus_list_features"}
+                },
+                "required": ["edition", "features"]
+            }),
+        }
+    }
+    fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
+        use crate::server::features::{build_key, validate};
+        use crate::server::jobs::{self, JobKind, JobSpec};
+        use std::collections::BTreeSet;
+        let edition = match try_arg!(arg_str(args, "edition")).as_str() {
+            "public" => Edition::Public,
+            "ee" => Edition::Ee,
+            other => return ToolResult::err(format!("invalid edition '{other}': use \"public\" or \"ee\"")),
+        };
+        let mut features = BTreeSet::new();
+        for v in args.get("features").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]) {
+            match serde_json::from_value::<Feature>(v.clone()) {
+                Ok(f) => { features.insert(f); }
+                Err(_) => return ToolResult::err(format!("unknown feature {v}; see arcus_list_features")),
+            }
+        }
+        if let Err(e) = validate(edition, &features) { return ToolResult::err(e); }
+        let missing = missing_tools(&on_path);
+        if !missing.is_empty() {
+            return ToolResult::err(format!("Missing build tools: {}\nAsk the user to run: {}",
+                missing.join(", "), install_hint(detect_os(), &missing)));
+        }
+        let token = if edition == Edition::Ee {
+            match find_token(find_gh(&ctx.home).as_deref()) {
+                Some(t) => Some(t),
+                None => return ToolResult::err("No GitHub token found for the EE edition. Call arcus_ee_login, show the code and URL to the user, then retry."),
+            }
+        } else { None };
+        let releases = match release::list_releases(edition, token.as_ref()) {
+            Ok(l) => l,
+            Err(e) => return ToolResult::err(format!("arcus_install failed to list versions: {e}")),
+        };
+        let version = match arg_opt_str(args, "version") {
+            Some(v) => v,
+            None => match releases.first() {
+                Some(r) => r.version.clone(),
+                None => return ToolResult::err("no releases found"),
+            },
+        };
+        if !releases.iter().any(|r| r.version == version) {
+            return ToolResult::err(format!("version {version} not found; see arcus_list_versions"));
+        }
+        let key = build_key(edition, &version, &features);
+        let params = json!({
+            "edition": if edition == Edition::Ee { "ee" } else { "public" },
+            "version": version,
+            "features": features,
+            "build_key": key,
+        });
+        match jobs::submit(&ctx.home, JobSpec { kind: JobKind::Install, params }) {
+            Ok(id) => ToolResult::ok(
+                format!("Started build {key} as job {id}. Poll arcus_job_status with this id until it is succeeded."),
+                Some(json!({"job_id": id, "build_key": key}))),
+            Err(e) => ToolResult::err(format!("failed to start the install job: {e}")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +506,17 @@ mod tests {
         let t = registry().into_iter().find(|t| t.spec().name == "arcus_list_versions").unwrap();
         assert!(t.call(&ctx(), &json!({})).is_error);
         assert!(t.call(&ctx(), &json!({"edition": "x"})).is_error);
+    }
+
+    #[test]
+    fn install_rejects_invalid_features() {
+        let c = ctx();
+        let t = registry().into_iter().find(|t| t.spec().name == "arcus_install").unwrap();
+        let r = t.call(&c, &json!({"edition": "public", "features": ["repl"]}));
+        assert!(r.is_error);
+        assert!(r.text.contains("EE"), "{}", r.text);
+        assert!(t.call(&c, &json!({"edition": "public", "features": ["bogus"]})).is_error);
+        assert!(!c.home.jobs().exists() || std::fs::read_dir(c.home.jobs()).unwrap().next().is_none());
     }
 
     #[test]
