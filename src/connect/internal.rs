@@ -2,6 +2,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
+use super::{stdout_sink, Sink};
 use rsasl::prelude::*;
 
 pub(crate) fn authenticate<S>(mut stream: S) -> io::Result<S>
@@ -87,15 +88,16 @@ pub(crate) trait Stream: Read + Write + Send + Sized + 'static {
 }
 
 /// Writes requests to a stream while a background thread copies every
-/// response byte to stdout as it arrives.
+/// response byte to the sink (stdout by default) as it arrives.
 pub(crate) struct StreamClient<S: Stream> {
     pub auth: bool,
+    pub sink: Sink,
     conn: Option<S>,
     done: Option<Receiver<()>>,
 }
 
 impl<S: Stream> Default for StreamClient<S> {
-    fn default() -> Self { Self { auth: false, conn: None, done: None } }
+    fn default() -> Self { Self { auth: false, sink: stdout_sink(), conn: None, done: None } }
 }
 
 impl<S: Stream> StreamClient<S> {
@@ -106,16 +108,17 @@ impl<S: Stream> StreamClient<S> {
 
         let mut reader = stream.try_clone()?;
         let (tx, rx) = mpsc::channel();
+        let sink = self.sink.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
-            let stdout = io::stdout();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        let mut out = stdout.lock();
-                        let _ = out.write_all(&buf[..n]);
-                        let _ = out.flush();
+                        if let Ok(mut out) = sink.lock() {
+                            let _ = out.write_all(&buf[..n]);
+                            let _ = out.flush();
+                        }
                     }
                 }
             }
