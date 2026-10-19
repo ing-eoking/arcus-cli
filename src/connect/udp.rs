@@ -1,6 +1,7 @@
 use std::io::{self, ErrorKind, Write};
 use std::net::{ToSocketAddrs, UdpSocket};
 use std::time::Duration;
+use super::{stdout_sink, Sink};
 
 const HEADER_SIZE: usize = 8;
 /// memcached reads a UDP request into a single 64KB buffer and rejects
@@ -8,11 +9,15 @@ const HEADER_SIZE: usize = 8;
 const MAX_REQUEST: usize = 65507 - HEADER_SIZE;
 const MAX_DATAGRAM: usize = 65535;
 
-#[derive(Default)]
 pub struct UdpClient {
     pub rqid: u16,
     pub wait: Duration,
+    pub sink: Sink,
     conn: Option<UdpSocket>,
+}
+
+impl Default for UdpClient {
+    fn default() -> Self { Self { rqid: 0, wait: Duration::ZERO, sink: stdout_sink(), conn: None } }
 }
 
 impl UdpClient {
@@ -48,7 +53,7 @@ impl UdpClient {
 
         if !expect_reply { return Ok(()); }
         let response = Self::receive(sock, rqid)?;
-        let mut out = io::stdout().lock();
+        let mut out = self.sink.lock().map_err(|_| io::Error::other("output sink poisoned"))?;
         out.write_all(&response)?;
         out.flush()
     }

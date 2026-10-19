@@ -1,3 +1,4 @@
+use std::io::{self, Write};
 use std::rc::Rc;
 use std::time::Duration;
 use rustyline::{Editor, Context};
@@ -231,7 +232,6 @@ struct ZkClient {
 /// Prompt for a `digest` id/password on stdin (password hidden).
 /// Returns None if input could not be read.
 fn prompt_credentials() -> Option<(String, String)> {
-    use std::io::{self, Write};
     let mut id = String::new();
     print!("id: ");
     io::stdout().flush().ok()?;
@@ -247,17 +247,19 @@ impl ZkClient {
     }
 
     /// Run a ZK operation. If it fails with `NoAuth` (the node's ACL requires
-    /// authentication), prompt for a digest id/password, add it to the session,
-    /// and retry the operation exactly once.
-    fn with_auth_retry<T>(&self, mut op: impl FnMut() -> ZkResult<T>) -> ZkResult<T> {
+    /// authentication) and `interactive`, prompt for a digest id/password, add it
+    /// to the session, and retry the operation exactly once. When not interactive
+    /// (stdin is not ours to read) the `NoAuth` error is returned as is.
+    fn with_auth_retry<T>(&self, out: &mut dyn Write, interactive: bool,
+                          mut op: impl FnMut() -> ZkResult<T>) -> ZkResult<T> {
         match op() {
-            Err(ZkError::NoAuth) => {
-                eprintln!("Authentication required for this node.");
+            Err(ZkError::NoAuth) if interactive => {
+                let _ = writeln!(out, "Authentication required for this node.");
                 match prompt_credentials() {
                     Some((id, pw)) => {
                         let auth = format!("{}:{}", id, pw).into_bytes();
                         if let Err(e) = self.zk.add_auth("digest", auth) {
-                            eprintln!("ERROR: add_auth failed: {:?}", e);
+                            let _ = writeln!(out, "ERROR: add_auth failed: {:?}", e);
                             return Err(ZkError::NoAuth);
                         }
                         op()
@@ -269,89 +271,91 @@ impl ZkClient {
         }
     }
 
-    fn print_stat(&self, stat: &zookeeper::Stat) {
-        println!("czxid: {}", stat.czxid);
-        println!("mzxid: {}", stat.mzxid);
-        println!("ctime: {}", stat.ctime);
-        println!("mtime: {}", stat.mtime);
-        println!("version: {}", stat.version);
-        println!("cversion: {}", stat.cversion);
-        println!("aversion: {}", stat.aversion);
-        println!("ephemeralOwner: {}", stat.ephemeral_owner);
-        println!("dataLength: {}", stat.data_length);
-        println!("numChildren: {}", stat.num_children);
-        println!("pzxid: {}", stat.pzxid);
+    fn print_stat(&self, out: &mut dyn Write, stat: &zookeeper::Stat) {
+        let _ = writeln!(out, "czxid: {}", stat.czxid);
+        let _ = writeln!(out, "mzxid: {}", stat.mzxid);
+        let _ = writeln!(out, "ctime: {}", stat.ctime);
+        let _ = writeln!(out, "mtime: {}", stat.mtime);
+        let _ = writeln!(out, "version: {}", stat.version);
+        let _ = writeln!(out, "cversion: {}", stat.cversion);
+        let _ = writeln!(out, "aversion: {}", stat.aversion);
+        let _ = writeln!(out, "ephemeralOwner: {}", stat.ephemeral_owner);
+        let _ = writeln!(out, "dataLength: {}", stat.data_length);
+        let _ = writeln!(out, "numChildren: {}", stat.num_children);
+        let _ = writeln!(out, "pzxid: {}", stat.pzxid);
     }
 
-    fn ls_recursive(&self, path: &str) {
-        println!("{}", path);
-        match self.with_auth_retry(|| self.zk.get_children(path, false)) {
+    fn ls_recursive(&self, out: &mut dyn Write, interactive: bool, path: &str) {
+        let _ = writeln!(out, "{}", path);
+        match self.with_auth_retry(out, interactive, || self.zk.get_children(path, false)) {
             Ok(children) => {
                 for child in children {
-                    self.ls_recursive(&join_zk_path(path, &child));
+                    self.ls_recursive(out, interactive, &join_zk_path(path, &child));
                 }
             }
-            Err(e) => eprintln!("ERROR: {}: {:?}", path, e),
+            Err(e) => { let _ = writeln!(out, "ERROR: {}: {:?}", path, e); }
         }
     }
 
-    /// Runs one command. Returns true when the loop should exit.
-    fn execute(&self, cmd: ZkCommand) -> bool {
+    /// Runs one command, writing its output (and `ERROR: ` lines) to `out`.
+    /// Returns true when the loop should exit.
+    fn execute(&self, cmd: ZkCommand, out: &mut dyn Write, interactive: bool) -> bool {
+        macro_rules! say { ($($t:tt)*) => {{ let _ = writeln!(out, $($t)*); }} }
         match cmd {
             ZkCommand::Quit => return true,
-            ZkCommand::Help => println!("{}", HELP_TEXT),
+            ZkCommand::Help => say!("{}", HELP_TEXT),
             ZkCommand::Empty => {}
-            ZkCommand::Unknown(msg) => eprintln!("ERROR: {}", msg),
+            ZkCommand::Unknown(msg) => say!("ERROR: {}", msg),
             ZkCommand::Ls { path, recursive, stat } => {
                 if recursive {
-                    self.ls_recursive(&path);
+                    self.ls_recursive(out, interactive, &path);
                 } else {
-                    match self.with_auth_retry(|| self.zk.get_children(&path, false)) {
-                        Ok(children) => println!("[{}]", children.join(", ")),
-                        Err(e) => eprintln!("ERROR: {:?}", e),
+                    match self.with_auth_retry(out, interactive, || self.zk.get_children(&path, false)) {
+                        Ok(children) => say!("[{}]", children.join(", ")),
+                        Err(e) => say!("ERROR: {:?}", e),
                     }
                 }
                 if stat {
-                    match self.with_auth_retry(|| self.zk.exists(&path, false)) {
-                        Ok(Some(s)) => self.print_stat(&s),
-                        Ok(None) => eprintln!("ERROR: no such node: {}", path),
-                        Err(e) => eprintln!("ERROR: {:?}", e),
+                    match self.with_auth_retry(out, interactive, || self.zk.exists(&path, false)) {
+                        Ok(Some(s)) => self.print_stat(out, &s),
+                        Ok(None) => say!("ERROR: no such node: {}", path),
+                        Err(e) => say!("ERROR: {:?}", e),
                     }
                 }
             }
-            ZkCommand::Get(path) => match self.with_auth_retry(|| self.zk.get_data(&path, false)) {
-                Ok((data, _stat)) => println!("{}", String::from_utf8_lossy(&data)),
-                Err(e) => eprintln!("ERROR: {:?}", e),
+            ZkCommand::Get(path) => match self.with_auth_retry(out, interactive, || self.zk.get_data(&path, false)) {
+                Ok((data, _stat)) => say!("{}", String::from_utf8_lossy(&data)),
+                Err(e) => say!("ERROR: {:?}", e),
             },
             ZkCommand::Create(path, data) => {
-                match self.with_auth_retry(|| self.zk.create(&path, data.clone(), Acl::open_unsafe().clone(), CreateMode::Persistent)) {
-                    Ok(created) => println!("Created {}", created),
-                    Err(e) => eprintln!("ERROR: {:?}", e),
+                match self.with_auth_retry(out, interactive, || self.zk.create(&path, data.clone(), Acl::open_unsafe().clone(), CreateMode::Persistent)) {
+                    Ok(created) => say!("Created {}", created),
+                    Err(e) => say!("ERROR: {:?}", e),
                 }
             }
-            ZkCommand::Set(path, data) => match self.with_auth_retry(|| self.zk.set_data(&path, data.clone(), None)) {
-                Ok(stat) => println!("version: {}", stat.version),
-                Err(e) => eprintln!("ERROR: {:?}", e),
+            ZkCommand::Set(path, data) => match self.with_auth_retry(out, interactive, || self.zk.set_data(&path, data.clone(), None)) {
+                Ok(stat) => say!("version: {}", stat.version),
+                Err(e) => say!("ERROR: {:?}", e),
             },
-            ZkCommand::Delete(path) => match self.with_auth_retry(|| self.zk.delete(&path, None)) {
-                Ok(()) => println!("Deleted {}", path),
-                Err(e) => eprintln!("ERROR: {:?}", e),
+            ZkCommand::Delete(path) => match self.with_auth_retry(out, interactive, || self.zk.delete(&path, None)) {
+                Ok(()) => say!("Deleted {}", path),
+                Err(e) => say!("ERROR: {:?}", e),
             },
-            ZkCommand::Stat(path) => match self.with_auth_retry(|| self.zk.exists(&path, false)) {
-                Ok(Some(stat)) => self.print_stat(&stat),
-                Ok(None) => eprintln!("ERROR: no such node: {}", path),
-                Err(e) => eprintln!("ERROR: {:?}", e),
+            ZkCommand::Stat(path) => match self.with_auth_retry(out, interactive, || self.zk.exists(&path, false)) {
+                Ok(Some(stat)) => self.print_stat(out, &stat),
+                Ok(None) => say!("ERROR: no such node: {}", path),
+                Err(e) => say!("ERROR: {:?}", e),
             },
             ZkCommand::Password { path, password } => {
                 let node = join_zk_path(&path, "authPassword");
                 let secret = scram_sha256(&password).into_bytes();
-                match self.with_auth_retry(|| self.zk.create(&node, secret.clone(), Acl::open_unsafe().clone(), CreateMode::Persistent)) {
-                    Ok(created) => println!("Created {}", created),
-                    Err(ZkError::NodeExists) => match self.with_auth_retry(|| self.zk.set_data(&node, secret.clone(), None)) {
-                        Ok(stat) => println!("Updated {} (version: {})", node, stat.version),
-                        Err(e) => eprintln!("ERROR: {:?}", e),
+                match self.with_auth_retry(out, interactive, || self.zk.create(&node, secret.clone(), Acl::open_unsafe().clone(), CreateMode::Persistent)) {
+                    Ok(created) => say!("Created {}", created),
+                    Err(ZkError::NodeExists) => match self.with_auth_retry(out, interactive, || self.zk.set_data(&node, secret.clone(), None)) {
+                        Ok(stat) => say!("Updated {} (version: {})", node, stat.version),
+                        Err(e) => say!("ERROR: {:?}", e),
                     },
-                    Err(e) => eprintln!("ERROR: {:?}", e),
+                    Err(e) => say!("ERROR: {:?}", e),
                 }
             }
             ZkCommand::Setacl { path, id, password, perms } => {
@@ -359,18 +363,28 @@ impl ZkClient {
                 // the digest ACL does not lock this session out of the node.
                 let auth = format!("{}:{}", id, password).into_bytes();
                 if let Err(e) = self.zk.add_auth("digest", auth) {
-                    eprintln!("ERROR: add_auth failed: {:?}", e);
+                    say!("ERROR: add_auth failed: {:?}", e);
                 } else {
                     let acl = vec![Acl::new(perms, "digest", zk_digest_id(&id, &password))];
-                    match self.with_auth_retry(|| self.zk.set_acl(&path, acl.clone(), None)) {
-                        Ok(stat) => println!("ACL set on {} (aversion: {})", path, stat.aversion),
-                        Err(e) => eprintln!("ERROR: {:?}", e),
+                    match self.with_auth_retry(out, interactive, || self.zk.set_acl(&path, acl.clone(), None)) {
+                        Ok(stat) => say!("ACL set on {} (aversion: {})", path, stat.aversion),
+                        Err(e) => say!("ERROR: {:?}", e),
                     }
                 }
             }
         }
         false
     }
+}
+
+/// Connects to `ensemble`, runs one command non-interactively and returns its output.
+pub fn zk_exec(ensemble: &str, cmd: ZkCommand) -> io::Result<String> {
+    let zk = ZooKeeper::connect(ensemble, Duration::from_secs(5), |_ev: WatchedEvent| {})
+        .map_err(|e| io::Error::other(format!("Failed to connect to ZooKeeper at {}: {:?}", ensemble, e)))?;
+    let client = ZkClient::new(Rc::new(zk));
+    let mut buf = Vec::new();
+    client.execute(cmd, &mut buf, false);
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 #[derive(Helper, Hinter, Highlighter, Validator)]
@@ -430,7 +444,7 @@ pub fn run_repl(addr: &str, timeout: Duration) -> rustyline::Result<()> {
         match rl.readline("") {
             Ok(line) => {
                 let _ = rl.add_history_entry(line.as_str());
-                if client.execute(parse(&line)) {
+                if client.execute(parse(&line), &mut io::stdout(), true) {
                     break;
                 }
             }
