@@ -2,6 +2,7 @@ use super::{arg_bool, arg_opt_str, arg_str, arg_u64, Ctx, Tool, ToolResult, Tool
 use crate::connect::collect_responses;
 use crate::server::build::{detect_os, install_hint, missing_tools, on_path};
 use crate::server::features::{Edition, Feature};
+use crate::server::release::{self, find_gh, find_token};
 use crate::server::secret::{random_password, write_secret};
 use crate::zk::{zk_exec, ZkCommand};
 use serde_json::{json, Value};
@@ -23,6 +24,8 @@ pub fn registry() -> Vec<Box<dyn Tool>> {
         Box::new(ListFeatures),
         Box::new(CheckPrerequisites),
         Box::new(JobStatusTool),
+        Box::new(ListVersions),
+        Box::new(EeLogin),
     ]
 }
 
@@ -263,6 +266,91 @@ impl Tool for JobStatusTool {
     }
 }
 
+struct ListVersions;
+impl Tool for ListVersions {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "arcus_list_versions",
+            description: "List installable ARCUS server versions for an edition, newest first. The EE edition needs a \
+                GitHub login; if it reports that none exists, call arcus_ee_login.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {"edition": {"type": "string", "enum": ["public", "ee"], "description": "ARCUS edition"}},
+                "required": ["edition"]
+            }),
+        }
+    }
+    fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
+        let edition = match try_arg!(arg_str(args, "edition")).as_str() {
+            "public" => Edition::Public,
+            "ee" => Edition::Ee,
+            other => return ToolResult::err(format!("invalid edition '{other}': use \"public\" or \"ee\"")),
+        };
+        let login_hint = "EE access needs a GitHub login: call arcus_ee_login, show the code and URL to the user, then retry.";
+        let token = if edition == Edition::Ee {
+            match find_token(find_gh(&ctx.home).as_deref()) {
+                Some(t) => Some(t),
+                None => return ToolResult::err(format!("No GitHub token found. {login_hint}")),
+            }
+        } else { None };
+        match release::list_releases(edition, token.as_ref()) {
+            Ok(list) => {
+                let versions: Vec<&str> = list.iter().map(|r| r.version.as_str()).collect();
+                ToolResult::ok(versions.join("\n"), Some(json!({"versions": versions})))
+            }
+            Err(e) if edition == Edition::Ee && (e.kind() == std::io::ErrorKind::PermissionDenied
+                || e.kind() == std::io::ErrorKind::NotFound) =>
+                ToolResult::err(format!("GitHub denied access to the EE releases ({e}). {login_hint}")),
+            Err(e) => ToolResult::err(format!("arcus_list_versions failed: {e}")),
+        }
+    }
+}
+
+struct EeLogin;
+impl Tool for EeLogin {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "arcus_ee_login",
+            description: "Start a GitHub browser (device) login to get access to the private EE sources. Returns a one-time \
+                code and URL; show both to the user, who approves in a browser. No token passes through this conversation.",
+            input_schema: json!({"type": "object", "properties": {}}),
+        }
+    }
+    fn call(&self, ctx: &Ctx, _args: &Value) -> ToolResult {
+        use crate::server::jobs::{self, JobKind, JobSpec, JobState};
+        // Downloading gh happens synchronously, before the job is submitted.
+        if find_gh(&ctx.home).is_none() {
+            if let Err(e) = release::download_gh(&ctx.home) {
+                return ToolResult::err(format!("GitHub CLI (gh) is not installed and downloading it failed: {e}"));
+            }
+        }
+        let id = match jobs::submit(&ctx.home, JobSpec { kind: JobKind::EeLogin, params: json!({}) }) {
+            Ok(id) => id,
+            Err(e) => return ToolResult::err(format!("failed to start the login job: {e}")),
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(s) = jobs::status(&ctx.home, &id) {
+                let code = s.result.as_ref().and_then(|r| r["code"].as_str()).map(str::to_string);
+                if let Some(code) = code {
+                    let url = s.result.as_ref().and_then(|r| r["url"].as_str()).unwrap_or(release::DEVICE_URL).to_string();
+                    return ToolResult::ok(
+                        format!("Show this to the user: open {url} and enter the one-time code {code}. \
+                            Then poll arcus_job_status with id {id} until it is succeeded."),
+                        Some(json!({"job_id": id, "code": code, "url": url})));
+                }
+                if s.state != JobState::Running {
+                    return ToolResult::err(format!("login job {id} {:?}: {}", s.state, s.message));
+                }
+            }
+            if std::time::Instant::now() >= deadline { break; }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let tail = jobs::status(&ctx.home, &id).and_then(|s| jobs::tail(&s.log, 20)).unwrap_or_default();
+        ToolResult::err(format!("no device code within 30 seconds (job {id}). Log tail:\n{tail}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +420,19 @@ mod tests {
         assert!(!r.is_error);
         let s = r.structured.unwrap();
         assert!(s["missing"].is_array() && s["hint"].is_string());
+    }
+
+    #[test]
+    fn list_versions_validates_edition() {
+        let t = registry().into_iter().find(|t| t.spec().name == "arcus_list_versions").unwrap();
+        assert!(t.call(&ctx(), &json!({})).is_error);
+        assert!(t.call(&ctx(), &json!({"edition": "x"})).is_error);
+    }
+
+    #[test]
+    fn ee_tools_registered() {
+        let names: Vec<_> = registry().iter().map(|t| t.spec().name).collect();
+        assert!(names.contains(&"arcus_list_versions") && names.contains(&"arcus_ee_login"));
     }
 
     #[test]
