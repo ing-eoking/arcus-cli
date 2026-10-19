@@ -148,9 +148,18 @@ pub fn ruok(port: u16) -> bool {
     buf.trim() == "imok"
 }
 
+fn ensure_port_free(port: u16) -> io::Result<()> {
+    if ruok(port) {
+        return Err(io::Error::new(io::ErrorKind::AddrInUse, format!(
+            "port {port} is already served by another ZooKeeper; pass a different `port`, or use that ensemble (127.0.0.1:{port}) directly")));
+    }
+    Ok(())
+}
+
 pub fn start(home: &Home, port: u16, version: &str) -> io::Result<u32> {
     if let Some(pid) = live_java_pid(home) { return Ok(pid); }
     if !valid_version(version) { return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid ZooKeeper version `{version}`"))); }
+    ensure_port_free(port)?;
     let dist = home.zookeeper_dist(version);
     if !dist.join("lib").is_dir() {
         return Err(io::Error::new(io::ErrorKind::NotFound, format!("ZooKeeper {version} is not downloaded")));
@@ -170,13 +179,15 @@ pub fn start(home: &Home, port: u16, version: &str) -> io::Result<u32> {
     std::fs::write(pid_file(home), pid.to_string())?;
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
+        if let Ok(Some(st)) = child.try_wait() {
+            let _ = std::fs::remove_file(pid_file(home));
+            let logp = zk.join("zookeeper.log");
+            return Err(io::Error::other(format!("ZooKeeper exited ({st}); see {}\n{}",
+                logp.display(), super::jobs::tail(&logp, 20).unwrap_or_default())));
+        }
         if ruok(port) {
             std::thread::spawn(move || { let _ = child.wait(); });
             return Ok(pid);
-        }
-        if let Ok(Some(st)) = child.try_wait() {
-            let _ = std::fs::remove_file(pid_file(home));
-            return Err(io::Error::other(format!("ZooKeeper exited ({st}); see {}", zk.join("zookeeper.log").display())));
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -218,6 +229,19 @@ mod tests {
         let (t, s) = dist_urls("3.8.6");
         assert_eq!(t, "https://archive.apache.org/dist/zookeeper/zookeeper-3.8.6/apache-zookeeper-3.8.6-bin.tar.gz");
         assert_eq!(s, format!("{t}.sha512"));
+    }
+    #[test] fn port_already_served_is_refused() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let t = std::thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((mut s, _)) = l.accept() { let mut b = [0u8; 4]; let _ = s.read_exact(&mut b); let _ = s.write_all(b"imok"); }
+            }
+        });
+        let e = ensure_port_free(port).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AddrInUse);
+        assert!(e.to_string().contains(&format!("port {port} is already served")));
+        drop(t);
     }
     #[test] fn version_validation() { assert!(valid_version("3.8.6")); assert!(!valid_version("../x")); }
     #[test] fn stop_without_pid_is_error() {
