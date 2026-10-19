@@ -85,6 +85,14 @@ fn main() -> rustyline::Result<()> {
                 eprintln!("ERROR: {e}");
                 std::process::exit(1);
             }
+        } else if let Some(id) = &args.job {
+            if let Err(e) = server::jobs::run_job(&home, id) {
+                eprintln!("ERROR: {e}");
+                std::process::exit(1);
+            }
+            let ok = server::jobs::status(&home, id)
+                .map(|s| s.state == server::jobs::JobState::Succeeded).unwrap_or(false);
+            std::process::exit(if ok { 0 } else { 1 });
         } else {
             eprintln!("not implemented yet");
             std::process::exit(1);
