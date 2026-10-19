@@ -90,7 +90,7 @@ impl Runner for RealRunner {
     }
 }
 
-fn extract(tarball: &Path, dest: &Path) -> io::Result<PathBuf> {
+pub(crate) fn extract(tarball: &Path, dest: &Path) -> io::Result<PathBuf> {
     let _ = std::fs::remove_dir_all(dest);
     std::fs::create_dir_all(dest)?;
     let gz = flate2::read::GzDecoder::new(std::fs::File::open(tarball)?);

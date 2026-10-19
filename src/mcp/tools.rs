@@ -27,6 +27,8 @@ pub fn registry() -> Vec<Box<dyn Tool>> {
         Box::new(ListVersions),
         Box::new(EeLogin),
         Box::new(Install),
+        Box::new(ZkStart),
+        Box::new(ZkStop),
     ]
 }
 
@@ -430,6 +432,76 @@ impl Tool for Install {
     }
 }
 
+struct ZkStart;
+impl Tool for ZkStart {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "arcus_zk_start",
+            description: "Start a local single-node ZooKeeper for development. If ZooKeeper (or Java) is not downloaded yet, \
+                this submits a download job and returns job_id: poll arcus_job_status until it is succeeded, then call this again. \
+                Without any Java installed, set download_jre=true to also download a Temurin 17 JRE.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "port": {"type": "integer", "description": "Client port (default 2181)"},
+                    "version": {"type": "string", "description": "ZooKeeper version (default 3.8.x)"},
+                    "download_jre": {"type": "boolean", "description": "Download a Temurin 17 JRE if no Java is found (default false)"}
+                }
+            }),
+        }
+    }
+    fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
+        use crate::server::jobs::{self, JobKind, JobSpec};
+        use crate::server::zookeeper as zk;
+        let port = match arg_u64(args, "port") {
+            None => 2181,
+            Some(p) if (1..=65535).contains(&p) => p as u16,
+            Some(p) => return ToolResult::err(format!("invalid port {p}")),
+        };
+        let version = arg_opt_str(args, "version").unwrap_or_else(|| zk::DEFAULT_ZK_VERSION.to_string());
+        if !zk::valid_version(&version) { return ToolResult::err(format!("invalid ZooKeeper version `{version}`")); }
+        let want_jre = arg_bool(args, "download_jre", false);
+        let have_dist = ctx.home.zookeeper_dist(&version).join("lib").is_dir();
+        let have_java = zk::find_java(&ctx.home).is_some();
+        if !have_java && !want_jre {
+            return ToolResult::err("No Java 8+ found. Ask the user to install a JDK/JRE (e.g. `brew install openjdk` or \
+                `sudo apt-get install default-jre`), or call again with download_jre=true to download a Temurin 17 JRE.");
+        }
+        if !have_dist || !have_java {
+            let params = json!({"version": version, "download_jre": !have_java});
+            return match jobs::submit(&ctx.home, JobSpec { kind: JobKind::ZkDownload, params }) {
+                Ok(id) => ToolResult::ok(
+                    format!("Started the ZooKeeper download as job {id}. Poll arcus_job_status until it is succeeded, then call arcus_zk_start again."),
+                    Some(json!({"job_id": id}))),
+                Err(e) => ToolResult::err(format!("failed to start the download job: {e}")),
+            };
+        }
+        match zk::start(&ctx.home, port, &version) {
+            Ok(pid) => {
+                let ensemble = format!("127.0.0.1:{port}");
+                ToolResult::ok(format!("ZooKeeper is running at {ensemble} (pid {pid})"), Some(json!({"ensemble": ensemble, "pid": pid})))
+            }
+            Err(e) => ToolResult::err(format!("arcus_zk_start failed: {e}")),
+        }
+    }
+}
+
+struct ZkStop;
+impl Tool for ZkStop {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "arcus_zk_stop",
+            description: "Stop the local ZooKeeper started by arcus_zk_start.",
+            input_schema: json!({"type": "object", "properties": {}}),
+        }
+    }
+    fn call(&self, ctx: &Ctx, _args: &Value) -> ToolResult {
+        match crate::server::zookeeper::stop(&ctx.home) {
+            Ok(()) => ToolResult::ok("Stopped the local ZooKeeper.", None),
+            Err(e) => ToolResult::err(format!("arcus_zk_stop failed: {e}")),
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,7 +540,7 @@ mod tests {
     #[test]
     fn registry_has_no_delete_and_expected_tools() {
         let names: Vec<_> = registry().iter().map(|t| t.spec().name).collect();
-        for n in ["memcached_command", "zk_ls", "zk_get", "zk_create", "zk_set", "zk_password"] {
+        for n in ["memcached_command", "zk_ls", "zk_get", "zk_create", "zk_set", "zk_password", "arcus_zk_start", "arcus_zk_stop"] {
             assert!(names.contains(&n), "{n}");
         }
         assert!(!names.iter().any(|n| n.contains("delete")));
