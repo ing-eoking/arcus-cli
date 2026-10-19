@@ -56,6 +56,14 @@ impl JobCtx {
             let _ = write_status(&self.home, &s);
         }
     }
+
+    /// Writes a partial `result` into `status.json` while the job keeps running (best effort).
+    pub fn publish(&self, partial: Value) {
+        if let Ok(mut s) = read_status(&self.home, &self.id) {
+            s.result = Some(partial);
+            let _ = write_status(&self.home, &s);
+        }
+    }
 }
 
 /// A `running` job with no known pid is considered dead once `status.json` is this old.
@@ -68,6 +76,7 @@ fn handler(kind: JobKind) -> Option<Handler> {
     match kind {
         #[cfg(test)]
         JobKind::Test => Some(test_handler),
+        JobKind::EeLogin => Some(super::release::ee_login_job),
         _ => None,
     }
 }
@@ -284,11 +293,11 @@ mod tests {
     }
     #[test] fn unregistered_kind_fails() {
         let h = home("nohandler");
-        let id = prepare(&h, &JobSpec { kind: JobKind::EeLogin, params: json!({}) }).unwrap();
+        let id = prepare(&h, &JobSpec { kind: JobKind::ZkDownload, params: json!({}) }).unwrap();
         run_job(&h, &id).unwrap();
         let s = status(&h, &id).unwrap();
         assert_eq!(s.state, JobState::Failed);
-        assert!(s.message.contains("no handler for ee_login"));
+        assert!(s.message.contains("no handler for zk_download"));
     }
     #[test] fn dead_running_job_is_failed() {
         let h = home("dead");
@@ -342,6 +351,15 @@ mod tests {
         assert_eq!(tail(&p, 2).unwrap(), "c\nd");
         assert_eq!(tail(&p, 10).unwrap(), "a\nb\nc\nd");
         assert_eq!(tail(&h.root.join("missing"), 3).unwrap(), "");
+    }
+    #[test] fn publish_sets_result_without_changing_state() {
+        let h = home("publish");
+        let id = prepare(&h, &JobSpec { kind: JobKind::Test, params: json!({}) }).unwrap();
+        let ctx = JobCtx { id: id.clone(), home: h.clone(), log: h.root.join("x.log") };
+        ctx.publish(json!({"code": "AAAA-BBBB"}));
+        let s = status(&h, &id).unwrap();
+        assert_eq!(s.state, JobState::Running);
+        assert_eq!(s.result, Some(json!({"code": "AAAA-BBBB"})));
     }
     #[test] fn kind_serializes_snake_case() {
         assert_eq!(serde_json::to_value(JobKind::ZkDownload).unwrap(), json!("zk_download"));
