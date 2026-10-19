@@ -76,15 +76,15 @@ pub fn install_hint(os: Os, missing: &[&str]) -> String {
 
 /// Runs one build command with stdout/stderr appended to `log`.
 pub trait Runner {
-    fn run(&mut self, program: &str, args: &[String], cwd: &Path, log: &Path) -> io::Result<bool>;
+    fn run(&mut self, program: &str, args: &[String], env: &[(String, String)], cwd: &Path, log: &Path) -> io::Result<bool>;
 }
 
 pub struct RealRunner;
 
 impl Runner for RealRunner {
-    fn run(&mut self, program: &str, args: &[String], cwd: &Path, log: &Path) -> io::Result<bool> {
+    fn run(&mut self, program: &str, args: &[String], env: &[(String, String)], cwd: &Path, log: &Path) -> io::Result<bool> {
         let out = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
-        let status = Command::new(program).args(args).current_dir(cwd)
+        let status = Command::new(program).args(args).envs(env.iter().map(|(k, v)| (k, v))).current_dir(cwd)
             .stdin(Stdio::null()).stdout(out.try_clone()?).stderr(out).status()?;
         Ok(status.success())
     }
@@ -118,15 +118,19 @@ pub fn build(tarball: &Path, prefix: &Path, features: &BTreeSet<Feature>, log: &
     let fail = |name: &str| io::Error::other(format!(
         "build step `{name}` failed; see {}\n{}", log.display(), tail(log, 20).unwrap_or_default()));
     let p = prefix.display().to_string();
-    let plan: [(&str, &str, Vec<String>); 4] = [
-        ("deps", "./deps/install.sh", vec![p]),
-        ("configure", "./configure", configure_args(features, prefix)),
-        ("make", "make", vec![]),
-        ("make install", "make", vec!["install".to_string()]),
+    // cyrus-sasl hardcodes framedir=/Library/Frameworks/...; override it so install stays in the prefix.
+    let deps_env: Vec<(String, String)> = if cfg!(target_os = "macos") {
+        vec![("MAKEFLAGS".into(), format!("framedir={p}/Frameworks/SASL2.framework"))]
+    } else { vec![] };
+    let plan: [(&str, &str, Vec<String>, Vec<(String, String)>); 4] = [
+        ("deps", "./deps/install.sh", vec![p], deps_env),
+        ("configure", "./configure", configure_args(features, prefix), vec![]),
+        ("make", "make", vec![], vec![]),
+        ("make install", "make", vec!["install".to_string()], vec![]),
     ];
-    for (name, program, args) in plan {
+    for (name, program, args, env) in plan {
         step(name);
-        let ok = runner.run(program, &args, &src, log)?;
+        let ok = runner.run(program, &args, &env, &src, log)?;
         if name == "deps" { append_file(log, &src.join("deps").join("install.log")); }
         if !ok { return Err(fail(name)); }
     }
@@ -173,9 +177,10 @@ mod tests {
     use std::path::PathBuf;
     use crate::server::features::{configure_args, Feature};
 
-    struct Rec { calls: Vec<(String, Vec<String>, PathBuf)>, fail_on: Option<&'static str> }
+    struct Rec { calls: Vec<(String, Vec<String>, PathBuf)>, envs: Vec<Vec<(String, String)>>, fail_on: Option<&'static str> }
     impl Runner for Rec {
-        fn run(&mut self, program: &str, args: &[String], cwd: &Path, _log: &Path) -> io::Result<bool> {
+        fn run(&mut self, program: &str, args: &[String], env: &[(String, String)], cwd: &Path, _log: &Path) -> io::Result<bool> {
+            self.envs.push(env.to_vec());
             self.calls.push((program.into(), args.to_vec(), cwd.to_path_buf()));
             Ok(self.fail_on != Some(program) || args.first().map(String::as_str) == Some("install"))
         }
@@ -208,7 +213,7 @@ mod tests {
         let tarball = tiny_tarball(&d);
         let prefix = d.join("prefix");
         let features = BTreeSet::from([Feature::Zk]);
-        let mut r = Rec { calls: vec![], fail_on: None };
+        let mut r = Rec { calls: vec![], envs: vec![], fail_on: None };
         let steps = std::cell::RefCell::new(Vec::new());
         build(&tarball, &prefix, &features, &d.join("job.log"), &mut r, &|s| steps.borrow_mut().push(s.to_string())).unwrap();
         let progs: Vec<_> = r.calls.iter().map(|c| c.0.as_str()).collect();
@@ -216,6 +221,13 @@ mod tests {
         assert_eq!(r.calls[1].1, configure_args(&features, &prefix));
         assert_eq!(r.calls[3].1, ["install"]);
         assert!(r.calls[0].2.ends_with("prefix.src/arcus-memcached-1.0.0"));
+        for (i, e) in r.envs.iter().enumerate() {
+            if i == 0 && cfg!(target_os = "macos") {
+                assert_eq!(*e, [("MAKEFLAGS".to_string(), format!("framedir={}/Frameworks/SASL2.framework", prefix.display()))]);
+            } else {
+                assert!(e.is_empty());
+            }
+        }
         assert_eq!(*steps.borrow(), ["deps", "configure", "make", "make install"]);
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -225,7 +237,7 @@ mod tests {
         let d = tmp("fail");
         let tarball = tiny_tarball(&d);
         let log = d.join("job.log");
-        let mut r = Rec { calls: vec![], fail_on: Some("make") };
+        let mut r = Rec { calls: vec![], envs: vec![], fail_on: Some("make") };
         let e = build(&tarball, &d.join("prefix"), &BTreeSet::new(), &log, &mut r, &|_| {}).unwrap_err();
         let m = e.to_string();
         assert!(m.contains("make") && m.contains(&log.display().to_string()), "{m}");
@@ -238,7 +250,7 @@ mod tests {
         let prefix = d.join("prefix");
         std::fs::create_dir_all(prefix.join("bin")).unwrap();
         std::fs::write(prefix.join("bin/memcached"), "").unwrap();
-        let mut r = Rec { calls: vec![], fail_on: None };
+        let mut r = Rec { calls: vec![], envs: vec![], fail_on: None };
         build(&d.join("missing.tar.gz"), &prefix, &BTreeSet::new(), &d.join("l"), &mut r, &|_| {}).unwrap();
         assert!(r.calls.is_empty());
         let _ = std::fs::remove_dir_all(&d);
