@@ -1,5 +1,7 @@
 use super::{arg_bool, arg_opt_str, arg_str, arg_u64, Ctx, Tool, ToolResult, ToolSpec};
 use crate::connect::collect_responses;
+use crate::server::build::{detect_os, install_hint, missing_tools, on_path};
+use crate::server::features::{Edition, Feature};
 use crate::server::secret::{random_password, write_secret};
 use crate::zk::{zk_exec, ZkCommand};
 use serde_json::{json, Value};
@@ -18,6 +20,8 @@ pub fn registry() -> Vec<Box<dyn Tool>> {
         Box::new(ZkCreate),
         Box::new(ZkSet),
         Box::new(ZkPassword),
+        Box::new(ListFeatures),
+        Box::new(CheckPrerequisites),
     ]
 }
 
@@ -174,6 +178,63 @@ impl Tool for ZkPassword {
     }
 }
 
+struct ListFeatures;
+impl Tool for ListFeatures {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "arcus_list_features",
+            description: "List the optional features that can be built into an ARCUS server for an edition. \
+                Propose the recommended features to the user first; mention advanced (non-recommended) \
+                features only when the user asks for them.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "edition": {"type": "string", "enum": ["public", "ee"], "description": "ARCUS edition"}
+                },
+                "required": ["edition"]
+            }),
+        }
+    }
+    fn call(&self, _ctx: &Ctx, args: &Value) -> ToolResult {
+        let edition = match try_arg!(arg_str(args, "edition")).as_str() {
+            "public" => Edition::Public,
+            "ee" => Edition::Ee,
+            other => return ToolResult::err(format!("invalid edition '{other}': use \"public\" or \"ee\"")),
+        };
+        let list: Vec<Value> = Feature::ALL.iter()
+            .filter(|f| edition == Edition::Ee || !f.ee_only())
+            .map(|f| json!({"name": f.key(), "label": f.label(), "recommended": f.recommended(), "ee_only": f.ee_only()}))
+            .collect();
+        let text = list.iter()
+            .map(|v| format!("{} - {}{}", v["name"].as_str().unwrap_or(""), v["label"].as_str().unwrap_or(""),
+                if v["recommended"] == true { " (recommended)" } else { "" }))
+            .collect::<Vec<_>>().join("\n");
+        ToolResult::ok(text, Some(Value::Array(list)))
+    }
+}
+
+struct CheckPrerequisites;
+impl Tool for CheckPrerequisites {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "arcus_check_prerequisites",
+            description: "Check that the build tools needed to compile ARCUS are installed. Returns the missing \
+                tools and an install command to show the user; it is never run automatically.",
+            input_schema: json!({"type": "object", "properties": {}}),
+        }
+    }
+    fn call(&self, _ctx: &Ctx, _args: &Value) -> ToolResult {
+        let missing = missing_tools(&on_path);
+        let hint = if missing.is_empty() { String::new() } else { install_hint(detect_os(), &missing) };
+        let text = if missing.is_empty() {
+            "All build prerequisites are installed.".to_string()
+        } else {
+            format!("Missing: {}\nSuggested install (run it yourself): {hint}", missing.join(", "))
+        };
+        ToolResult::ok(text, Some(json!({"missing": missing, "hint": hint})))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,5 +283,26 @@ mod tests {
     fn memcached_command_requires_command() {
         let t = registry().into_iter().find(|t| t.spec().name == "memcached_command").unwrap();
         assert!(t.call(&ctx(), &json!({})).is_error);
+    }
+
+    #[test]
+    fn public_features_hide_ee_only() {
+        let t = registry().into_iter().find(|t| t.spec().name == "arcus_list_features").unwrap();
+        let r = t.call(&ctx(), &json!({"edition": "public"}));
+        assert!(!r.is_error);
+        let names: Vec<_> = r.structured.unwrap().as_array().unwrap().iter()
+            .map(|v| v["name"].as_str().unwrap().to_string()).collect();
+        assert_eq!(names, ["zk", "sasl", "persistence", "sticky"]);
+        assert!(t.call(&ctx(), &json!({"edition": "x"})).is_error);
+        assert!(t.call(&ctx(), &json!({})).is_error);
+    }
+
+    #[test]
+    fn check_prerequisites_returns_missing_and_hint() {
+        let t = registry().into_iter().find(|t| t.spec().name == "arcus_check_prerequisites").unwrap();
+        let r = t.call(&ctx(), &json!({}));
+        assert!(!r.is_error);
+        let s = r.structured.unwrap();
+        assert!(s["missing"].is_array() && s["hint"].is_string());
     }
 }
