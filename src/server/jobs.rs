@@ -71,14 +71,14 @@ const NO_PID_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 type Handler = fn(&JobCtx, &Value) -> Result<Value, String>;
 
-/// Job handler lookup; Tasks 6-8 register Install / ZkDownload / EeLogin here.
+/// Job handler lookup; Every JobKind registers its handler here.
 fn handler(kind: JobKind) -> Option<Handler> {
     match kind {
         #[cfg(test)]
         JobKind::Test => Some(test_handler),
         JobKind::Install => Some(super::build::install_job),
         JobKind::EeLogin => Some(super::release::ee_login_job),
-        _ => None,
+        JobKind::ZkDownload => Some(super::zookeeper::download_job),
     }
 }
 
@@ -291,14 +291,6 @@ mod tests {
         let s = status(&h, &id).unwrap();
         assert_eq!(s.state, JobState::Failed);
         assert!(s.message.contains("kaboom"));
-    }
-    #[test] fn unregistered_kind_fails() {
-        let h = home("nohandler");
-        let id = prepare(&h, &JobSpec { kind: JobKind::ZkDownload, params: json!({}) }).unwrap();
-        run_job(&h, &id).unwrap();
-        let s = status(&h, &id).unwrap();
-        assert_eq!(s.state, JobState::Failed);
-        assert!(s.message.contains("no handler for zk_download"));
     }
     #[test] fn dead_running_job_is_failed() {
         let h = home("dead");

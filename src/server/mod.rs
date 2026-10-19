@@ -5,3 +5,4 @@ pub mod secret;
 pub mod fetch;
 pub mod jobs;
 pub mod release;
+pub mod zookeeper;
