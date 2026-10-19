@@ -58,6 +58,9 @@ impl JobCtx {
     }
 }
 
+/// A `running` job with no known pid is considered dead once `status.json` is this old.
+const NO_PID_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 type Handler = fn(&JobCtx, &Value) -> Result<Value, String>;
 
 /// Job handler lookup; Tasks 6-8 register Install / ZkDownload / EeLogin here.
@@ -142,7 +145,12 @@ pub fn submit(home: &Home, spec: JobSpec) -> io::Result<String> {
         .spawn();
     match spawned {
         // Reap the child when it ends so a crashed job is not mistaken for a live zombie.
-        Ok(mut child) => { std::thread::spawn(move || { let _ = child.wait(); }); Ok(id) }
+        Ok(mut child) => {
+            // Written by the parent right after spawn, so it exists even if the child dies early.
+            let _ = std::fs::write(job_dir(home, &id)?.join("pid"), child.id().to_string());
+            std::thread::spawn(move || { let _ = child.wait(); });
+            Ok(id)
+        }
         Err(e) => {
             if let Ok(mut s) = read_status(home, &id) {
                 s.state = JobState::Failed;
@@ -203,16 +211,24 @@ fn pid_alive(pid: u32) -> bool {
 pub fn status(home: &Home, id: &str) -> io::Result<JobStatus> {
     let mut s = read_status(home, id)?;
     if s.state == JobState::Running {
-        if let Some(pid) = s.pid {
-            if !pid_alive(pid) {
-                // The job may have finished between the read and the liveness check.
-                let again = read_status(home, id)?;
-                if again.state != JobState::Running { return Ok(again); }
-                s.state = JobState::Failed;
-                let t = tail(&s.log, 20).unwrap_or_default();
-                s.message = if t.is_empty() { "job process exited unexpectedly".into() }
-                    else { format!("job process exited unexpectedly\n{t}") };
-            }
+        let dir = job_dir(home, id)?;
+        let pid = s.pid.or_else(|| {
+            std::fs::read_to_string(dir.join("pid")).ok().and_then(|t| t.trim().parse().ok())
+        });
+        let gone = match pid {
+            Some(pid) => !pid_alive(pid),
+            // No pid from either source: the job never started (or died before recording it).
+            None => std::fs::metadata(dir.join("status.json")).and_then(|m| m.modified()).ok()
+                .and_then(|t| t.elapsed().ok()).is_some_and(|age| age > NO_PID_GRACE),
+        };
+        if gone {
+            // The job may have finished between the read and the liveness check.
+            let again = read_status(home, id)?;
+            if again.state != JobState::Running { return Ok(again); }
+            s.state = JobState::Failed;
+            let t = tail(&s.log, 20).unwrap_or_default();
+            s.message = if t.is_empty() { "job process exited unexpectedly".into() }
+                else { format!("job process exited unexpectedly\n{t}") };
         }
     }
     Ok(s)
@@ -281,6 +297,27 @@ mod tests {
         assert_eq!(s.state, JobState::Running);
         s.pid = Some(999_999);
         write_status(&h, &s).unwrap();
+        let s = status(&h, &id).unwrap();
+        assert_eq!(s.state, JobState::Failed);
+        assert!(s.message.contains("job process exited unexpectedly"));
+    }
+    #[test] fn dead_pid_file_without_status_pid_is_failed() {
+        let h = home("pidfile");
+        let id = prepare(&h, &JobSpec { kind: JobKind::Test, params: json!({}) }).unwrap();
+        let pid_file = h.jobs().join(&id).join("pid");
+        std::fs::write(&pid_file, "999999").unwrap();
+        let s = status(&h, &id).unwrap();
+        assert_eq!(s.state, JobState::Failed);
+        assert!(s.message.contains("job process exited unexpectedly"));
+        std::fs::write(&pid_file, std::process::id().to_string()).unwrap();
+        assert_eq!(status(&h, &id).unwrap().state, JobState::Running);
+    }
+    #[test] fn no_pid_and_old_status_is_failed() {
+        let h = home("nopid");
+        let id = prepare(&h, &JobSpec { kind: JobKind::Test, params: json!({}) }).unwrap();
+        assert_eq!(status(&h, &id).unwrap().state, JobState::Running); // fresh: still starting
+        let f = std::fs::OpenOptions::new().write(true).open(h.jobs().join(&id).join("status.json")).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60)).unwrap();
         let s = status(&h, &id).unwrap();
         assert_eq!(s.state, JobState::Failed);
         assert!(s.message.contains("job process exited unexpectedly"));
