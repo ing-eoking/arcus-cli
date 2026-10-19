@@ -209,7 +209,7 @@ impl Tool for ListFeatures {
             .map(|v| format!("{} - {}{}", v["name"].as_str().unwrap_or(""), v["label"].as_str().unwrap_or(""),
                 if v["recommended"] == true { " (recommended)" } else { "" }))
             .collect::<Vec<_>>().join("\n");
-        ToolResult::ok(text, Some(Value::Array(list)))
+        ToolResult::ok(text, Some(json!({"features": list})))
     }
 }
 
@@ -290,7 +290,7 @@ mod tests {
         let t = registry().into_iter().find(|t| t.spec().name == "arcus_list_features").unwrap();
         let r = t.call(&ctx(), &json!({"edition": "public"}));
         assert!(!r.is_error);
-        let names: Vec<_> = r.structured.unwrap().as_array().unwrap().iter()
+        let names: Vec<_> = r.structured.unwrap()["features"].as_array().unwrap().iter()
             .map(|v| v["name"].as_str().unwrap().to_string()).collect();
         assert_eq!(names, ["zk", "sasl", "persistence", "sticky"]);
         assert!(t.call(&ctx(), &json!({"edition": "x"})).is_error);
