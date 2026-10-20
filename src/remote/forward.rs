@@ -14,6 +14,9 @@ pub fn ssh_error_result(e: SshError) -> ToolResult {
         SshError::HostKeyUnknown { fingerprint } => ToolResult::err(format!(
             "unknown host key (fingerprint: {fingerprint}). Show this fingerprint to the user; only after the user agrees, \
 call again with accept_host_key: true")),
+        SshError::HostKeyManual { label } => ToolResult::err(format!(
+            "the host key of `{label}` cannot be shown here (jump host / proxy, or no fingerprint available). Do NOT use accept_host_key. \
+Ask the user to verify the host key by running `ssh {label}` once in a terminal, then retry")),
         SshError::HostKeyChanged => ToolResult::err(
             "the host key has CHANGED (possible man-in-the-middle). Do not retry; tell the user to verify the machine"),
         SshError::AuthFailed { hint } => ToolResult::err(format!("authentication failed: {hint}")),

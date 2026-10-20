@@ -320,7 +320,13 @@ pub fn cluster_zk_start(args: &Value, fwd: &dyn Fn(&str, &Value, &str) -> ToolRe
         let my_ids: Vec<u64> = parsed.iter().filter(|p| p.1 == *m).map(|p| p.0).collect();
         let mut a = json!({"members": members, "my_ids": my_ids});
         if let Some(v) = args.get("version").filter(|v| !v.is_null()) { a["version"] = v.clone(); }
+        if arg_bool(args, "download_jre", false) { a["download_jre"] = json!(true); }
         let r = fwd("arcus_zk_start", &a, m);
+        if r.is_error && r.text.contains("No Java") {
+            return ToolResult::err(format!(
+                "`{m}` has no Java 8+. Ask the user whether to download a Temurin 17 JRE there (or install a JDK/JRE on `{m}` themselves); \
+only if they agree, call arcus_cluster_zk_start again with the same nodes and download_jre: true."));
+        }
         if r.is_error { return ToolResult::err(format!("starting ZooKeeper on `{m}` failed: {}", r.text)); }
         let st = r.structured.as_ref();
         if st.and_then(|s| s.get("already_running")).and_then(Value::as_bool) == Some(true) {
@@ -412,7 +418,8 @@ every node serves. If ZooKeeper must be downloaded first, returns jobs to poll, 
                 "type": "object",
                 "properties": {
                     "nodes": {"type": "array", "description": "[{id, machine, address, client_port, peer_port, election_port}]", "items": {"type": "object"}},
-                    "version": {"type": "string", "description": "ZooKeeper version (recommended 3.8.6)"}
+                    "version": {"type": "string", "description": "ZooKeeper version (recommended 3.8.6)"},
+                    "download_jre": {"type": "boolean", "description": "default false; only after the user agrees to download a JRE on machines without Java"}
                 },
                 "required": ["nodes"]
             }),
@@ -640,6 +647,27 @@ mod tests {
         let s = r.structured.unwrap();
         assert_eq!(s["ensemble"], "10.0.0.1:2181,10.0.0.2:2181,10.0.0.3:2181");
         assert_eq!(s["nodes"][0]["mode"], "leader");
+    }
+
+    #[test]
+    fn cluster_start_forwards_download_jre_and_asks_on_missing_java() {
+        let seen = RefCell::new(Vec::new());
+        let fwd = |tool: &str, a: &Value, _m: &str| -> ToolResult {
+            if tool == "arcus_zk_start" {
+                seen.borrow_mut().push(a.get("download_jre").cloned());
+                if a.get("download_jre").is_none() { return ToolResult::err("No Java 8+ found. Ask the user ..."); }
+                return ToolResult::ok("job", Some(json!({"job_id": "j"})));
+            }
+            ToolResult::ok("m", Some(json!({"mode": "leader"})))
+        };
+        let short = std::time::Duration::from_millis(30);
+        let r = cluster_zk_start(&start_args(), &fwd, short, std::time::Duration::from_millis(5));
+        assert!(r.is_error && r.text.contains("download_jre: true") && r.text.contains("`a`"), "{}", r.text);
+        let mut args = start_args();
+        args["download_jre"] = json!(true);
+        let r = cluster_zk_start(&args, &fwd, short, std::time::Duration::from_millis(5));
+        assert!(!r.is_error, "{}", r.text);
+        assert!(seen.borrow().iter().skip(1).all(|v| *v == Some(json!(true))));
     }
 
     #[test]

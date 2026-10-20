@@ -1,4 +1,4 @@
-use super::{arg_bool, arg_opt_str, arg_str, arg_u64, Ctx, Tool, ToolResult, ToolSpec};
+use super::{arg_bool, arg_opt_str, arg_str, arg_u64, in_call_mode, Ctx, Tool, ToolResult, ToolSpec};
 use crate::connect::collect_responses;
 use crate::remote::forward::Remote;
 use crate::server::build::{detect_os, install_hint, missing_tools, on_path};
@@ -363,8 +363,9 @@ impl Tool for EeLogin {
     }
     fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
         use crate::server::jobs::{self, JobKind, JobSpec};
-        let has_dbus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty());
-        if plaintext_consent_needed(std::env::consts::OS, has_dbus, on_path("secret-tool"), arg_bool(args, "accept_plaintext_token", false)) {
+        let remote = in_call_mode() || std::env::var_os("SSH_CONNECTION").is_some_and(|v| !v.is_empty());
+        let keyring = std::env::consts::OS == "linux" && secret_service_available();
+        if plaintext_consent_needed(std::env::consts::OS, keyring, remote, arg_bool(args, "accept_plaintext_token", false)) {
             return plaintext_consent_error();
         }
         // The job downloads gh itself when it is missing, so this call never blocks on that download.
@@ -386,9 +387,23 @@ impl Tool for EeLogin {
     }
 }
 
-/// True on Linux without a keyring (no D-Bus session and no `secret-tool`) when the user has not consented to a plain-text token.
-fn plaintext_consent_needed(os: &str, has_dbus: bool, has_secret_tool: bool, accepted: bool) -> bool {
-    os == "linux" && !has_dbus && !has_secret_tool && !accepted
+/// True on Linux when gh would store the token in plain text and the user has not consented.
+/// `keyring` means a real Secret Service owner exists (a mere D-Bus session address is not enough: pam_systemd sets it over SSH);
+/// `remote` (SSH or `--call`) always requires consent because nobody can see a keyring prompt there.
+fn plaintext_consent_needed(os: &str, keyring: bool, remote: bool, accepted: bool) -> bool {
+    os == "linux" && (remote || !keyring) && !accepted
+}
+
+/// Whether `org.freedesktop.secrets` has an owner on the session bus.
+fn secret_service_available() -> bool {
+    if !std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty()) { return false; }
+    let run = |cmd: &str, args: &[&str]| std::process::Command::new(cmd).args(args)
+        .stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok();
+    if let Some(o) = run("dbus-send", &["--session", "--print-reply", "--dest=org.freedesktop.DBus", "/org/freedesktop/DBus",
+        "org.freedesktop.DBus.NameHasOwner", "string:org.freedesktop.secrets"]) {
+        return o.status.success() && String::from_utf8_lossy(&o.stdout).contains("boolean true");
+    }
+    run("busctl", &["--user", "status", "org.freedesktop.secrets"]).is_some_and(|o| o.status.success())
 }
 
 fn plaintext_consent_error() -> ToolResult {
@@ -1100,11 +1115,16 @@ mod tests {
 
     #[test]
     fn ee_login_requires_plaintext_consent_without_keyring() {
+        // (os, keyring, remote, accepted)
         assert!(plaintext_consent_needed("linux", false, false, false));
         assert!(!plaintext_consent_needed("linux", false, false, true));
         assert!(!plaintext_consent_needed("linux", true, false, false));
-        assert!(!plaintext_consent_needed("linux", false, true, false));
-        assert!(!plaintext_consent_needed("macos", false, false, false));
+        // DBUS address set but no Secret Service owner => keyring=false => consent still needed
+        assert!(plaintext_consent_needed("linux", false, false, false));
+        // SSH / --call always requires consent, even with a keyring
+        assert!(plaintext_consent_needed("linux", true, true, false));
+        assert!(!plaintext_consent_needed("linux", true, true, true));
+        assert!(!plaintext_consent_needed("macos", false, true, false));
         let r = plaintext_consent_error();
         assert!(r.is_error && r.text.contains("hosts.yml") && r.text.contains("accept_plaintext_token"), "{}", r.text);
     }
