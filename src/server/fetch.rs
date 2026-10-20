@@ -124,12 +124,11 @@ fn download(req: &Request, part: &Path, sum: Option<&Checksum>) -> io::Result<()
         out.write_all(&buf[..n])?;
     }
     out.flush()?;
-    if let (Some(h), Some(s)) = (hasher, sum) {
-        if !h.finish_hex().eq_ignore_ascii_case(expected(s)) {
+    if let (Some(h), Some(s)) = (hasher, sum)
+        && !h.finish_hex().eq_ignore_ascii_case(expected(s)) {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
                 format!("checksum mismatch for {}", safe_url(&req.url))));
         }
-    }
     Ok(())
 }
 

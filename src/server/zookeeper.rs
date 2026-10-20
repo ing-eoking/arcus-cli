@@ -46,7 +46,7 @@ fn java_ok(java: &Path) -> bool {
     Command::new(java).arg("-version").stdin(Stdio::null()).output().ok()
         .filter(|o| o.status.success())
         .and_then(|o| java_major(&String::from_utf8_lossy(&o.stderr)).or_else(|| java_major(&String::from_utf8_lossy(&o.stdout))))
-        .map_or(false, |m| m >= 8)
+        .is_some_and(|m| m >= 8)
 }
 
 fn jre_java(home: &Home) -> Vec<PathBuf> {

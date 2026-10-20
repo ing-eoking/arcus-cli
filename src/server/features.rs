@@ -79,11 +79,10 @@ impl Feature {
 }
 
 pub fn validate(edition: Edition, features: &BTreeSet<Feature>) -> Result<(), String> {
-    if edition == Edition::Public {
-        if let Some(f) = features.iter().find(|f| f.ee_only()) {
+    if edition == Edition::Public
+        && let Some(f) = features.iter().find(|f| f.ee_only()) {
             return Err(format!("feature '{}' is available only in the EE edition", f.key()));
         }
-    }
     for f in [Feature::Sasl, Feature::Repl] {
         if features.contains(&f) && !features.contains(&Feature::Zk) {
             return Err(format!("feature '{}' requires 'zk'", f.key()));

@@ -18,6 +18,8 @@ pub enum Os {
     Other,
 }
 
+type BuildStep = (&'static str, &'static str, Vec<String>, Vec<(String, String)>);
+
 pub fn detect_os() -> Os {
     if cfg!(target_os = "macos") {
         return Os::Mac;
@@ -50,10 +52,10 @@ pub fn missing_tools(have: &dyn Fn(&str) -> bool) -> Vec<&'static str> {
 /// Whether `name` resolves to an executable file in a PATH entry.
 pub fn on_path(name: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    env::var_os("PATH").map_or(false, |paths| {
+    env::var_os("PATH").is_some_and(|paths| {
         env::split_paths(&paths).any(|d| {
             std::fs::metadata(Path::new(&d).join(name))
-                .map_or(false, |m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         })
     })
 }
@@ -122,7 +124,7 @@ pub fn build(tarball: &Path, prefix: &Path, features: &BTreeSet<Feature>, log: &
     let deps_env: Vec<(String, String)> = if cfg!(target_os = "macos") {
         vec![("MAKEFLAGS".into(), format!("framedir={p}/Frameworks/SASL2.framework"))]
     } else { vec![] };
-    let plan: [(&str, &str, Vec<String>, Vec<(String, String)>); 4] = [
+    let plan: [BuildStep; 4] = [
         ("deps", "./deps/install.sh", vec![p], deps_env),
         ("configure", "./configure", configure_args(features, prefix), vec![]),
         ("make", "make", vec![], vec![]),

@@ -167,9 +167,8 @@ pub fn start(home: &Home, name: &InstanceName) -> io::Result<u32> {
     std::thread::spawn(move || { let _ = child.wait(); });
     let deadline = Instant::now() + READY_WAIT;
     while Instant::now() < deadline {
-        if responds(cfg.port, Duration::from_millis(300)) {
-            if let Some(pid) = read_pid(&p.server_pid()) { return Ok(pid); }
-        }
+        if responds(cfg.port, Duration::from_millis(300))
+            && let Some(pid) = read_pid(&p.server_pid()) { return Ok(pid); }
         if p.last_exit().exists() { break; }
         std::thread::sleep(POLL);
     }
