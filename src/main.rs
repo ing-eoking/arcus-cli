@@ -4,6 +4,7 @@ mod request;
 mod zk;
 mod mcp;
 mod server;
+mod remote;
 
 use std::path::PathBuf;
 use std::time;

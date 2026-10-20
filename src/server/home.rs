@@ -38,6 +38,12 @@ impl Home {
     pub fn zk_dir(&self) -> PathBuf { self.root.join("zk") }
     pub fn jobs(&self) -> PathBuf { self.root.join("jobs") }
     pub fn gh_dir(&self) -> PathBuf { self.root.join("gh") }
+    #[allow(dead_code)] // used by src/remote
+    pub fn hosts_file(&self) -> PathBuf { self.root.join("hosts.toml") }
+    #[allow(dead_code)]
+    pub fn ssh_dir(&self) -> PathBuf { self.root.join("ssh") }
+    #[allow(dead_code)]
+    pub fn dist_dir(&self) -> PathBuf { self.root.join("dist") }
     pub fn secrets(&self) -> PathBuf { self.root.join("secrets") }
     pub fn instance(&self, name: &InstanceName) -> PathBuf { self.root.join("instances").join(name.as_str()) }
 }
