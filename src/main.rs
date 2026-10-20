@@ -13,9 +13,12 @@ use rustyline::error::ReadlineError;
 use clap::{ArgAction, ArgGroup, Parser};
 use connect::Transport;
 
+/// Release tag baked in at build time (`dev` for local builds).
+pub const TAG: &str = match option_env!("ARCUS_CLI_TAG") { Some(t) => t, None => "dev" };
+
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-#[command(group(ArgGroup::new("mode").multiple(true).args(["mcp", "job", "supervise"])))]
+#[command(version = env!("ARCUS_CLI_VERSION"), about, long_about = None)]
+#[command(group(ArgGroup::new("mode").multiple(true).args(["mcp", "job", "supervise", "call"])))]
 struct Args {
     /// Host name or IP or Unix path
     #[arg(long, default_value_t = String::from("127.0.0.1"))]
@@ -62,6 +65,10 @@ struct Args {
     #[arg(long, hide = true, value_name = "ID")]
     job: Option<String>,
 
+    /// Run one tool and print its result as a single JSON line (internal)
+    #[arg(long, hide = true, value_name = "TOOL")]
+    call: Option<String>,
+
     /// Supervise a server instance (internal)
     #[arg(long, hide = true, value_name = "NAME")]
     supervise: Option<String>,
@@ -70,7 +77,7 @@ struct Args {
 fn main() -> rustyline::Result<()> {
     let args = Args::parse();
 
-    if args.mcp || args.job.is_some() || args.supervise.is_some() {
+    if args.mcp || args.job.is_some() || args.call.is_some() || args.supervise.is_some() {
         let home = match server::home::Home::new(args.home.clone()) {
             Ok(h) => h,
             Err(e) => { eprintln!("ERROR: cannot prepare home directory: {e}"); std::process::exit(1); }
@@ -83,6 +90,13 @@ fn main() -> rustyline::Result<()> {
                 eprintln!("ERROR: {e}");
                 std::process::exit(1);
             }
+        } else if let Some(tool) = &args.call {
+            let ctx = mcp::Ctx { home };
+            let ok = match mcp::run_call(tool, std::io::stdin().lock(), std::io::stdout().lock(), mcp::tools::registry(), ctx) {
+                Ok(ok) => ok,
+                Err(e) => { eprintln!("ERROR: {e}"); false }
+            };
+            std::process::exit(if ok { 0 } else { 1 });
         } else if let Some(id) = &args.job {
             if let Err(e) = server::jobs::run_job(&home, id) {
                 eprintln!("ERROR: {e}");
@@ -187,6 +201,10 @@ mod tests {
     #[test] fn mcp_conflicts_with_repl_flags() {
         assert!(Args::try_parse_from(["arcus-cli", "--mcp", "--zookeeper"]).is_err());
         assert!(Args::try_parse_from(["arcus-cli", "--mcp", "--host", "h"]).is_err());
+    }
+    #[test] fn call_with_home_parses() {
+        let a = Args::try_parse_from(["arcus-cli", "--call", "zk_ls", "--home", "/x"]).unwrap();
+        assert_eq!(a.call.as_deref(), Some("zk_ls"));
     }
     #[test] fn home_needs_a_mode() {
         assert!(Args::try_parse_from(["arcus-cli", "--home", "/x"]).is_err());

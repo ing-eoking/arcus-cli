@@ -34,6 +34,8 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build
+        env:
+          ARCUS_CLI_TAG: ${{ github.ref_name }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
