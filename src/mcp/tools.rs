@@ -45,16 +45,16 @@ impl Tool for MemcachedCommand {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "memcached_command",
-            description: "Send ASCII commands to an ARCUS/memcached server and return its response. \
-                Multiple commands and data lines are separated by newlines, e.g. \"set a 0 0 1\\na\\nget a\".",
+            description: "Send ASCII commands to an ARCUS/memcached server and return its response. Arguments with recommended \
+                values: propose them to the user and confirm before calling. Multiple commands and data lines are separated by newlines, e.g. \"set a 0 0 1\\na\\nget a\".",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "host": {"type": "string", "description": "Server host (default 127.0.0.1)"},
-                    "port": {"type": "integer", "description": "Server port (default 11211)"},
+                    "host": {"type": "string", "description": "Server host (recommended 127.0.0.1)"},
+                    "port": {"type": "integer", "description": "Server port (recommended 11211)"},
                     "unix_path": {"type": "string", "description": "Unix socket path; used instead of host/port"},
                     "command": {"type": "string", "description": "Commands separated by newlines, data lines included"},
-                    "idle_ms": {"type": "integer", "description": "Wait this long without new output before returning (default 300)"}
+                    "idle_ms": {"type": "integer", "description": "Wait this long without new output before returning (recommended 300)"}
                 },
                 "required": ["command"]
             }),
@@ -405,12 +405,13 @@ impl Tool for Install {
             name: "arcus_install",
             description: "Build and install an ARCUS server from source as a background job. Returns job_id and build_key; \
                 poll arcus_job_status until it is succeeded (the build can take several minutes). Missing build tools are \
-                reported with an install command to show the user. EE needs a GitHub login (arcus_ee_login).",
+                reported with an install command to show the user. EE needs a GitHub login (arcus_ee_login). Arguments with recommended values (version): \
+                propose them to the user and confirm before calling.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "edition": {"type": "string", "enum": ["public", "ee"], "description": "ARCUS edition"},
-                    "version": {"type": "string", "description": "Version to build (default: newest)"},
+                    "version": {"type": "string", "description": "Version to build (recommended: the newest; see arcus_list_versions)"},
                     "features": {"type": "array", "items": {"type": "string"},
                         "description": "Feature names from arcus_list_features"}
                 },
@@ -486,14 +487,22 @@ impl Tool for ZkStart {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "arcus_zk_start",
-            description: "Start a local single-node ZooKeeper for development. If ZooKeeper (or Java) is not downloaded yet, \
-                this submits a download job and returns job_id: poll arcus_job_status until it is succeeded, then call this again. \
-                Without any Java installed, set download_jre=true to also download a Temurin 17 JRE.",
+            description: "Start a local ZooKeeper ensemble (1 to 7 nodes, one process per node) for development. Arguments with \
+                recommended values: propose them to the user and confirm before calling (count, ports, version). If ZooKeeper \
+                (or Java) is not downloaded yet, this submits a download job and returns job_id: poll arcus_job_status until it is \
+                succeeded, then call this again. Without any Java installed, set download_jre=true to also download a Temurin 17 JRE. \
+                Returns the ensemble connect string. If a local ensemble is already running it is returned unchanged.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "port": {"type": "integer", "description": "Client port (default 2181)"},
-                    "version": {"type": "string", "description": "ZooKeeper version (default 3.8.x)"},
+                    "count": {"type": "integer", "minimum": 1, "maximum": 7, "description": "Number of ZooKeeper nodes (recommended 3; 1 = standalone)"},
+                    "client_ports": {"type": "array", "items": {"type": "integer"}, "description": "Client port per node, length = count (recommended 2181, 2182, ... consecutive)"},
+                    "peer_ports": {"type": "array", "items": {"type": "integer"}, "description": "Quorum peer port per node, length = count (recommended 2888, 2889, ... consecutive)"},
+                    "election_ports": {"type": "array", "items": {"type": "integer"}, "description": "Leader election port per node, length = count (recommended 3888, 3889, ... consecutive)"},
+                    "base_client_port": {"type": "integer", "description": "First client port when client_ports is omitted (recommended 2181)"},
+                    "base_peer_port": {"type": "integer", "description": "First peer port when peer_ports is omitted (recommended 2888)"},
+                    "base_election_port": {"type": "integer", "description": "First election port when election_ports is omitted (recommended 3888)"},
+                    "version": {"type": "string", "description": "ZooKeeper version (recommended 3.8.6)"},
                     "download_jre": {"type": "boolean", "description": "Download a Temurin 17 JRE if no Java is found (default false)"}
                 }
             }),
@@ -502,39 +511,44 @@ impl Tool for ZkStart {
     fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
         use crate::server::jobs::{self, JobKind, JobSpec};
         use crate::server::zookeeper as zk;
-        let port = match arg_u64(args, "port") {
-            None => 2181,
-            Some(p) if (1..=65535).contains(&p) => p as u16,
-            Some(p) => return ToolResult::err(format!("invalid port {p}")),
-        };
+        let nodes = match zk::nodes_from_args(args) { Ok(n) => n, Err(e) => return ToolResult::err(e) };
         let version = arg_opt_str(args, "version").unwrap_or_else(|| zk::DEFAULT_ZK_VERSION.to_string());
         if !zk::valid_version(&version) { return ToolResult::err(format!("invalid ZooKeeper version `{version}`")); }
         let want_jre = arg_bool(args, "download_jre", false);
         let have_dist = ctx.home.zookeeper_dist(&version).join("lib").is_dir();
         let have_java = zk::find_java(&ctx.home).is_some();
-        if !have_java && !want_jre {
-            return ToolResult::err("No Java 8+ found. Ask the user to install a JDK/JRE (e.g. `brew install openjdk` or \
-                `sudo apt-get install default-jre`), or call again with download_jre=true to download a Temurin 17 JRE.");
+        // A running ensemble is reported as it is; no download or Java is needed for that.
+        if zk::read_ensemble(&ctx.home).is_none() || !have_dist || !have_java {
+            if !have_java && !want_jre {
+                return ToolResult::err("No Java 8+ found. Ask the user to install a JDK/JRE (e.g. `brew install openjdk` or \
+                    `sudo apt-get install default-jre`), or call again with download_jre=true to download a Temurin 17 JRE.");
+            }
+            if !have_dist || !have_java {
+                let params = json!({"version": version, "download_jre": !have_java});
+                return match jobs::submit(&ctx.home, JobSpec { kind: JobKind::ZkDownload, params }) {
+                    Ok(id) => ToolResult::ok(
+                        format!("Started the ZooKeeper download as job {id}. Poll arcus_job_status until it is succeeded, then call arcus_zk_start again."),
+                        Some(json!({"job_id": id}))),
+                    Err(e) => ToolResult::err(format!("failed to start the download job: {e}")),
+                };
+            }
         }
-        if !have_dist || !have_java {
-            let params = json!({"version": version, "download_jre": !have_java});
-            return match jobs::submit(&ctx.home, JobSpec { kind: JobKind::ZkDownload, params }) {
-                Ok(id) => ToolResult::ok(
-                    format!("Started the ZooKeeper download as job {id}. Poll arcus_job_status until it is succeeded, then call arcus_zk_start again."),
-                    Some(json!({"job_id": id}))),
-                Err(e) => ToolResult::err(format!("failed to start the download job: {e}")),
-            };
-        }
-        match zk::start(&ctx.home, port, &version) {
-            Ok(pid) => {
-                // An already running local ZooKeeper keeps the port it was started with.
-                let actual = zk::configured_port(&ctx.home).unwrap_or(port);
-                let ensemble = format!("127.0.0.1:{actual}");
-                let note = if actual != port {
-                    format!(" It was already running on port {actual}, so the requested port {port} was not used; use {ensemble}.")
-                } else { String::new() };
-                ToolResult::ok(format!("ZooKeeper is running at {ensemble} (pid {pid}).{note}"),
-                    Some(json!({"ensemble": ensemble, "pid": pid, "requested_port": port, "port": actual})))
+        match zk::start(&ctx.home, &nodes, &version) {
+            Ok(st) => {
+                let ensemble = st.ensemble.connect_string();
+                let list: Vec<Value> = st.ensemble.nodes.iter().zip(&st.pids).map(|(n, pid)| json!({
+                    "id": n.id, "client_port": n.client_port, "peer_port": n.peer_port, "election_port": n.election_port,
+                    "pid": pid, "running": pid.is_some()})).collect();
+                let note = if !st.already_running { String::new() } else if st.ensemble.nodes == nodes && st.ensemble.version == version {
+                    " It was already running.".to_string()
+                } else {
+                    format!(" A local ensemble was already running with different settings (version {}), so nothing new was started; \
+                        use {ensemble}, or call arcus_zk_stop first to start the requested one.", st.ensemble.version)
+                };
+                let down = list.iter().filter(|n| n["running"] == false).count();
+                let note = if down > 0 { format!("{note} {down} node(s) are not running; call arcus_zk_stop and arcus_zk_start to restart the ensemble.") } else { note };
+                ToolResult::ok(format!("ZooKeeper ensemble is running at {ensemble}.{note}"),
+                    Some(json!({"ensemble": ensemble, "nodes": list, "already_running": st.already_running})))
             }
             Err(e) => ToolResult::err(format!("arcus_zk_start failed: {e}")),
         }
@@ -546,13 +560,13 @@ impl Tool for ZkStop {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "arcus_zk_stop",
-            description: "Stop the local ZooKeeper started by arcus_zk_start.",
+            description: "Stop every node of the local ZooKeeper ensemble started by arcus_zk_start. Data is kept.",
             input_schema: json!({"type": "object", "properties": {}}),
         }
     }
     fn call(&self, ctx: &Ctx, _args: &Value) -> ToolResult {
         match crate::server::zookeeper::stop(&ctx.home) {
-            Ok(()) => ToolResult::ok("Stopped the local ZooKeeper.", None),
+            Ok(n) => ToolResult::ok(format!("Stopped the local ZooKeeper ({n} process(es))."), Some(json!({"stopped": n}))),
             Err(e) => ToolResult::err(format!("arcus_zk_stop failed: {e}")),
         }
     }
@@ -610,12 +624,10 @@ fn setup_with(home: &crate::server::home::Home, args: &Value, connect: Connect, 
         let z = try_arg!(arg_str(args, "zk"));
         let svc = try_arg!(arg_str(args, "service_code"));
         let target = if z == "local" {
-            let zp = match arg_u64(args, "zk_port") {
-                None => 2181,
-                Some(p) if (1..=65535).contains(&p) => p,
-                Some(p) => return ToolResult::err(format!("invalid zk_port {p}")),
-            };
-            ZkTarget { ensemble: format!("127.0.0.1:{zp}"), local: true }
+            match crate::server::zookeeper::local_ensemble(home) {
+                Some(ensemble) => ZkTarget { ensemble, local: true },
+                None => return ToolResult::err("No local ZooKeeper ensemble is running. Call arcus_zk_start first (propose the node count and ports to the user), then retry."),
+            }
         } else {
             ZkTarget { ensemble: z, local: false }
         };
@@ -786,7 +798,8 @@ impl Tool for Setup {
                 Needs an existing build (arcus_install) and a reachable ZooKeeper (arcus_zk_start for local). Without apply it \
                 only returns the plan (create/same/differs per znode) and writes nothing; call with apply=true after the user \
                 agrees. With a local ZooKeeper and acl_user it creates the SASL user with a generated password saved to \
-                instances/<name>/sasl_password (never shown). Ask the user for any missing name, service_code, acl_group or repl_group.",
+                instances/<name>/sasl_password (never shown). Ask the user for any missing name, service_code, acl_group or repl_group (no defaults). Arguments with recommended \
+                values (port, memory_mb, repl_listen): propose them to the user and confirm before calling.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -794,15 +807,14 @@ impl Tool for Setup {
                     "edition": {"type": "string", "enum": ["public", "ee"]},
                     "version": {"type": "string", "description": "Version of the existing build"},
                     "features": {"type": "array", "items": {"type": "string"}, "description": "Same features as the build"},
-                    "port": {"type": "integer", "description": "Cache port (default 11211)"},
-                    "memory_mb": {"type": "integer", "description": "Cache memory in MB (default 64)"},
-                    "zk": {"type": "string", "description": "\"local\" (127.0.0.1:2181 unless zk_port) or an ensemble address; required with the zk feature"},
-                    "zk_port": {"type": "integer", "description": "Port of the local ZooKeeper (default 2181)"},
+                    "port": {"type": "integer", "description": "Cache port (recommended 11211)"},
+                    "memory_mb": {"type": "integer", "description": "Cache memory in MB (recommended 64)"},
+                    "zk": {"type": "string", "description": "\"local\" (the ensemble started by arcus_zk_start) or an ensemble address; required with the zk feature"},
                     "service_code": {"type": "string", "description": "Service code (cloud name); required with zk"},
                     "acl_group": {"type": "string", "description": "ACL group; required with sasl"},
                     "acl_user": {"type": "string", "description": "SASL user to create (local ZooKeeper only)"},
                     "repl_group": {"type": "string", "description": "Replication group; required with repl"},
-                    "repl_listen": {"type": "string", "description": "Replication listen ip:port (default <local ip>:<port+9000>)"},
+                    "repl_listen": {"type": "string", "description": "Replication listen ip:port (recommended <local ip>:<port+9000>)"},
                     "apply": {"type": "boolean", "description": "Write the changes (default false: plan only)"},
                     "overwrite": {"type": "array", "items": {"type": "string"}, "description": "Znode paths whose differing value may be replaced"}
                 },
@@ -880,7 +892,7 @@ impl Tool for StatusTool {
             name: "arcus_status",
             description: "Show whether cache server instances are running and responding, with the last recorded exit \
                 (exit code or signal). Omit name to list all instances.",
-            input_schema: json!({"type": "object", "properties": {"name": {"type": "string", "description": "Instance name (default: all)"}}}),
+            input_schema: json!({"type": "object", "properties": {"name": {"type": "string", "description": "Instance name; omit to list all instances"}}}),
         }
     }
     fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
@@ -1055,6 +1067,33 @@ mod tests {
         assert!(t.call(&ctx(), &json!({})).is_error);
     }
 
+    #[test]
+    fn schema_defaults_are_marked_recommended() {
+        for tool in registry() {
+            let spec = tool.spec();
+            let Some(props) = spec.input_schema["properties"].as_object() else { continue };
+            for (k, p) in props {
+                let d = p["description"].as_str().unwrap_or("");
+                if p["type"] != "boolean" && d.to_lowercase().contains("default") {
+                    assert!(d.contains("recommended"), "{}.{k}: {d}", spec.name);
+                }
+            }
+        }
+        let with_defaults = ["memcached_command", "arcus_zk_start", "arcus_setup", "arcus_install"];
+        for tool in registry().iter().filter(|t| with_defaults.contains(&t.spec().name)) {
+            assert!(tool.spec().description.contains("propose them to the user and confirm before calling"), "{}", tool.spec().name);
+        }
+    }
+
+    #[test]
+    fn zk_start_rejects_bad_ports_before_touching_anything() {
+        let c = ctx();
+        let t = registry().into_iter().find(|t| t.spec().name == "arcus_zk_start").unwrap();
+        let r = t.call(&c, &json!({"count": 2, "client_ports": [30001]}));
+        assert!(r.is_error && r.text.contains("client_ports"), "{}", r.text);
+        assert!(t.call(&c, &json!({"count": 9})).is_error);
+    }
+
     mod setup_tests {
         use super::*;
         use crate::server::znode::tests::MemStore;
@@ -1156,6 +1195,8 @@ mod tests {
         fn local_sasl_user_password_stays_out_of_output() {
             let h = tmp_home("sasl");
             fake_build(&h, "ee-0.12.1-zk_sasl");
+            crate::server::zookeeper::write_ensemble(&h, &crate::server::zookeeper::Ensemble { version: "3.8.6".into(),
+                nodes: vec![crate::server::zookeeper::Node { id: 1, client_port: 22181, peer_port: 22888, election_port: 23888 }] }).unwrap();
             let st = Rc::new(MemStore::default());
             let a = args(json!({"features": ["zk", "sasl"], "zk": "local", "acl_group": "grp", "acl_user": "dev"}));
             let dry = run(&h, &st, a.clone());
@@ -1178,6 +1219,26 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&pw_file).unwrap(), pw);
             assert_eq!(st.get("/arcus_acl/grp/dev/authPassword").unwrap().unwrap(), stored.as_bytes());
             assert!(r2.structured.unwrap()["written"].as_array().unwrap().is_empty());
+        }
+
+        #[test]
+        fn local_zk_resolves_to_the_ensemble_string() {
+            use crate::server::zookeeper::{write_ensemble, Ensemble, Node};
+            let h = tmp_home("localzk");
+            fake_build(&h, "ee-0.12.1-zk");
+            let seen = std::cell::RefCell::new(String::new());
+            let st = Rc::new(MemStore::default());
+            let go = |h: &Home| {
+                let s = st.clone();
+                setup_with(h, &args(json!({"zk": "local"})), &|e| { *seen.borrow_mut() = e.to_string(); Ok(s.clone() as Rc<dyn ZnodeStore>) }, &|_| Ok("10.0.0.1".parse().unwrap()))
+            };
+            let r = go(&h);
+            assert!(r.is_error && r.text.contains("arcus_zk_start"), "{}", r.text);
+            let nodes = (1..=3).map(|i| Node { id: i, client_port: 22180 + i as u16, peer_port: 22887 + i as u16, election_port: 23887 + i as u16 }).collect();
+            write_ensemble(&h, &Ensemble { version: "3.8.6".into(), nodes }).unwrap();
+            let r = go(&h);
+            assert!(!r.is_error, "{}", r.text);
+            assert_eq!(*seen.borrow(), "127.0.0.1:22181,127.0.0.1:22182,127.0.0.1:22183");
         }
 
         #[test]

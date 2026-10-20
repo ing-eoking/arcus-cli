@@ -110,7 +110,7 @@ args = ["--mcp"]
 | `arcus_ee_login` | GitHub device-code login for the private EE sources |
 | `arcus_install` | Build and install a server from source (background job) |
 | `arcus_job_status` | Poll a background job |
-| `arcus_zk_start` / `arcus_zk_stop` | Start or stop a local single-node ZooKeeper (downloads it first if needed) |
+| `arcus_zk_start` / `arcus_zk_stop` | Start or stop a local ZooKeeper ensemble of 1-7 nodes (downloads it first if needed). `count`, `client_ports`, `peer_ports`, `election_ports` (or `base_*_port`) and `version` are all chosen by the user; the recommended values are 3 nodes on 2181-2183 / 2888-2890 / 3888-3890. The running ensemble is recorded in `zk/ensemble.json`, and `arcus_setup` with `zk: "local"` uses it |
 | `arcus_setup` | Define a server instance and create its znodes; plan only unless `apply=true` |
 | `arcus_start` / `arcus_stop` / `arcus_status` | Run, stop and inspect instances (`arcus_stop` uses SIGTERM; `force` sends SIGKILL) |
 
