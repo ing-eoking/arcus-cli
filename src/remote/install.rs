@@ -50,14 +50,21 @@ pub fn daemon_command_for(os: &str, bin: &str, home: &str) -> String {
     format!("{setsid}nohup {bin} --agent --home {home} >> {home}/agent.log 2>&1 < /dev/null &")
 }
 
-fn stop_old_agent(mode: &str, os: &str) -> String {
-    match (mode, os) {
-        ("service", "Darwin") => "launchctl bootout gui/$(id -u)/com.arcus-cli.agent".to_string(),
-        ("service", _) => "systemctl --user stop arcus-cli-agent".to_string(),
-        _ => "pid=$(cat \"$HOME/.arcus-cli/agent.pid\") && kill \"$pid\"; \
-for i in 1 2 3 4 5; do kill -0 \"$pid\" 2>/dev/null || break; sleep 1; done; true".to_string(),
-    }
+/// Stops the old agent however it was started (unit, launchd, or daemon); "not present" is fine.
+/// Never touches supervisors or servers.
+fn stop_old_agent(os: &str) -> String {
+    let managed = if os == "Darwin" {
+        "launchctl bootout gui/$(id -u)/com.arcus-cli.agent 2>/dev/null || true"
+    } else {
+        "systemctl --user disable --now arcus-cli-agent 2>/dev/null || true"
+    };
+    format!("{managed}; pid=$(cat \"$HOME/.arcus-cli/agent.pid\" 2>/dev/null); \
+if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then kill \"$pid\" || true; fi; true")
 }
+
+/// Exit 0 when the old agent process is gone.
+const AGENT_GONE_CMD: &str = "pid=$(cat \"$HOME/.arcus-cli/agent.pid\" 2>/dev/null); \
+if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then exit 1; fi; exit 0";
 
 fn plan_steps(os: &str, mode: &str, replace: bool, has_agent: bool) -> Vec<String> {
     let mut s = vec![
@@ -68,7 +75,7 @@ fn plan_steps(os: &str, mode: &str, replace: bool, has_agent: bool) -> Vec<Strin
 (if refused, stop and offer daemon mode or an admin-enabled linger)".into());
     }
     if replace && has_agent {
-        s.push(format!("stop only the old agent (`{}`); supervisors and servers keep running", stop_old_agent(mode, os)));
+        s.push(format!("stop only the old agent (`{}`); supervisors and servers keep running", stop_old_agent(os)));
     }
     s.push(match (mode, os) {
         ("service", "Darwin") => "write ~/Library/LaunchAgents/com.arcus-cli.agent.plist and run `launchctl bootstrap gui/$(id -u) <plist>`".to_string(),
@@ -155,7 +162,11 @@ supervisors and servers keep running",
 
     macro_rules! t { ($e:expr) => { match $e { Ok(v) => v, Err(r) => return r } }; }
 
-    /* Linger first: nothing is changed on the machine if it is refused. */
+    let (local, used_tag) = match choose_binary(home, &target, tag_arg.as_deref(), binary_arg.as_deref().map(Path::new)) {
+        Ok(v) => v,
+        Err(e) => return ToolResult::err(e),
+    };
+    /* Linger next: nothing is changed on the machine if it is refused. */
     if mode == "service" && os == "Linux" {
         let o = t!(run("loginctl show-user \"$(id -un)\" -p Linger; id -un", b""));
         let text = String::from_utf8_lossy(&o.stdout).into_owned();
@@ -166,17 +177,22 @@ supervisors and servers keep running",
         }
     }
 
-    let (local, used_tag) = match choose_binary(home, &target, tag_arg.as_deref(), binary_arg.as_deref().map(Path::new)) {
-        Ok(v) => v,
-        Err(e) => return ToolResult::err(e),
-    };
     t!(must(&format!("mkdir -p \"{BIN_DIR}\" \"$HOME/.arcus-cli\""), b"", "creating ~/.arcus-cli/bin"));
     if let Err(e) = ssh.copy(&local, ".arcus-cli/bin/arcus-cli.new") { return ssh_error_result(e); }
     t!(must(&format!("chmod 755 \"{BIN}.new\" && mv -f \"{BIN}.new\" \"{BIN}\""), b"", "installing the binary"));
 
     if replace && has_agent {
         /* Only the agent: supervisors and servers are separate processes and keep running. */
-        t!(must(&stop_old_agent(&mode, &os), b"", "stopping the old agent"));
+        t!(must(&stop_old_agent(&os), b"", "stopping the old agent"));
+        let mut gone = false;
+        for i in 0..POLL_TRIES {
+            if i > 0 { std::thread::sleep(poll); }
+            if t!(run(AGENT_GONE_CMD, b"")).status == 0 { gone = true; break; }
+        }
+        if !gone {
+            return ToolResult::err(format!(
+                "the old agent on `{name}` did not stop within 10 s; the new agent was not started. Supervisors and servers were not touched"));
+        }
     }
 
     let bin = format!("{rhome}/.arcus-cli/bin/arcus-cli");
@@ -314,6 +330,45 @@ mod tests {
         let mv = c.iter().position(|x| x.contains("mv -f")).unwrap();
         let start = c.iter().position(|x| x.starts_with("setsid")).unwrap();
         assert!(mv < start);
+    }
+    #[test] fn replace_daemon_to_service_stops_unit_and_pid() {
+        let (home, cfg, bin) = setup("d2s");
+        let f = fake(vec![("uname", o(0, RUNNING, "")), ("show-user", o(0, "Linger=yes\nu\n", "")),
+            ("--agent-status", o(0, "{\"running\":true}\n", ""))]);
+        let r = host_install(&home, &f, &cfg,
+            &json!({"machine": "dev-1", "replace": true, "apply": true, "binary": bin.to_str().unwrap()}), Duration::ZERO);
+        assert!(!r.is_error, "{}", r.text);
+        let c = cmds(&f);
+        let stop = c.iter().position(|x| x.contains("disable --now") && x.contains("agent.pid") && x.contains("|| true")).unwrap();
+        let enable = c.iter().position(|x| x.contains("enable --now")).unwrap();
+        assert!(stop < enable);
+        assert!(!c.iter().any(|x| x.contains("pkill") || x.contains("--supervise")));
+    }
+    #[test] fn replace_service_to_daemon_disables_unit() {
+        let (home, cfg, bin) = setup("s2d");
+        let f = fake(vec![("uname", o(0, RUNNING, "")), ("--agent-status", o(0, "{\"running\":true}\n", ""))]);
+        let r = host_install(&home, &f, &cfg,
+            &json!({"machine": "dev-1", "mode": "daemon", "replace": true, "apply": true, "binary": bin.to_str().unwrap()}), Duration::ZERO);
+        assert!(!r.is_error, "{}", r.text);
+        let c = cmds(&f);
+        assert!(c.iter().any(|x| x.contains("systemctl --user disable --now arcus-cli-agent") && x.contains("kill \"$pid\"")));
+        assert!(c.iter().any(|x| x.starts_with("setsid nohup")));
+    }
+    #[test] fn old_agent_that_will_not_stop_is_error() {
+        let (home, cfg, bin) = setup("stuck");
+        let f = fake(vec![("uname", o(0, RUNNING, "")), ("exit 1", o(1, "", ""))]);
+        let r = host_install(&home, &f, &cfg,
+            &json!({"machine": "dev-1", "mode": "daemon", "replace": true, "apply": true, "binary": bin.to_str().unwrap()}), Duration::ZERO);
+        assert!(r.is_error && r.text.contains("did not stop"), "{}", r.text);
+        assert!(!cmds(&f).iter().any(|x| x.starts_with("setsid")));
+    }
+    #[test] fn binary_failure_changes_nothing_remote() {
+        let (home, cfg, _) = setup("nobin");
+        let f = fake(vec![("uname", o(0, IDLE, "")), ("show-user", o(0, "Linger=no\nu\n", ""))]);
+        let r = host_install(&home, &f, &cfg,
+            &json!({"machine": "dev-1", "apply": true, "binary": "/nonexistent/arcus-cli"}), Duration::ZERO);
+        assert!(r.is_error);
+        assert_eq!(f.calls.borrow().len(), 1);
     }
     #[test] fn service_linux_writes_unit_and_enables() {
         let (home, cfg, bin) = setup("svc");
