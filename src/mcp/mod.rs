@@ -70,7 +70,8 @@ fn handle(msg: &Value, tools: &[Box<dyn Tool>], ctx: &Ctx) -> Option<Value> {
             let empty = json!({});
             let args = params.get("arguments").filter(|a| a.is_object()).unwrap_or(&empty);
             let res = match tools.iter().find(|t| t.spec().name == name) {
-                Some(t) => t.call(ctx, args),
+                Some(t) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| t.call(ctx, args)))
+                    .unwrap_or_else(|_| ToolResult::err(format!("tool `{name}` panicked; the server is still running (see stderr)"))),
                 None => ToolResult::err(format!("unknown tool `{name}`")),
             };
             let mut out = json!({"content": [{"type": "text", "text": res.text}], "isError": res.is_error});
@@ -115,12 +116,18 @@ mod tests {
         }
     }
 
+    struct Boom;
+    impl Tool for Boom {
+        fn spec(&self) -> ToolSpec { ToolSpec { name: "boom", description: "Panics", input_schema: json!({"type":"object"}) } }
+        fn call(&self, _ctx: &Ctx, _args: &Value) -> ToolResult { panic!("kaboom") }
+    }
+
     fn raw(lines: &[&str]) -> String {
         let dir = std::env::temp_dir().join(format!("arcus-cli-mcp-test-{}", std::process::id()));
         let ctx = Ctx { home: crate::server::home::Home::new(Some(dir)).unwrap() };
         let mut out = Vec::new();
         let input = lines.join("\n") + "\n";
-        serve(Cursor::new(input), &mut out, vec![Box::new(Echo)], ctx).unwrap();
+        serve(Cursor::new(input), &mut out, vec![Box::new(Echo), Box::new(Boom)], ctx).unwrap();
         String::from_utf8(out).unwrap()
     }
     fn run(lines: &[&str]) -> Vec<Value> {
@@ -153,6 +160,13 @@ mod tests {
         assert_eq!(out[2]["error"]["code"], -32601);
         assert_eq!(out[3]["error"]["code"], -32700);
         assert_eq!(out[3]["id"], Value::Null);
+    }
+    #[test] fn panicking_tool_returns_error_and_server_continues() {
+        let out = run(&[r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"boom","arguments":{}}}"#,
+                        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{"text":"still"}}}"#]);
+        assert_eq!(out[0]["result"]["isError"], true);
+        assert!(out[0]["result"]["content"][0]["text"].as_str().unwrap().contains("panicked"));
+        assert_eq!(out[1]["result"]["content"][0]["text"], "still");
     }
     #[test] fn every_output_line_is_json() {
         let s = raw(&[r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, "garbage",
