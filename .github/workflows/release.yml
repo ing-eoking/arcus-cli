@@ -57,9 +57,11 @@ jobs:
 
       - name: Check glibc symbol version
         if: matrix.zigbuild
+        shell: bash
         run: |
           max=$(objdump -T "target/${{ matrix.target }}/release/arcus-cli" | grep -o 'GLIBC_2\.[0-9]*' | sort -uV | tail -1)
           echo "max GLIBC symbol version: $max"
+          [ -n "$max" ] || { echo "could not read GLIBC symbol versions"; exit 1; }
           [ "$(printf '%s\nGLIBC_2.34\n' "$max" | sort -V | tail -1)" = "GLIBC_2.34" ] || { echo "requires $max, above GLIBC_2.34"; exit 1; }
 
       - name: Package
