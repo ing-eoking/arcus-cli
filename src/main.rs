@@ -2,9 +2,7 @@ mod helper;
 mod connect;
 mod request;
 mod zk;
-#[allow(dead_code)] // consumed incrementally by later tasks
 mod mcp;
-#[allow(dead_code)]
 mod server;
 
 use std::path::PathBuf;
@@ -93,9 +91,16 @@ fn main() -> rustyline::Result<()> {
             let ok = server::jobs::status(&home, id)
                 .map(|s| s.state == server::jobs::JobState::Succeeded).unwrap_or(false);
             std::process::exit(if ok { 0 } else { 1 });
-        } else {
-            eprintln!("not implemented yet");
-            std::process::exit(1);
+        } else if let Some(name) = &args.supervise {
+            let name = match server::home::InstanceName::parse(name) {
+                Ok(n) => n,
+                Err(e) => { eprintln!("ERROR: {e}"); std::process::exit(1); }
+            };
+            if let Err(e) = server::supervise::supervise(&home, &name) {
+                eprintln!("ERROR: {e}");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
         }
         return Ok(());
     }

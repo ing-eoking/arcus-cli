@@ -30,6 +30,9 @@ pub fn registry() -> Vec<Box<dyn Tool>> {
         Box::new(ZkStart),
         Box::new(ZkStop),
         Box::new(Setup),
+        Box::new(Start),
+        Box::new(Stop),
+        Box::new(StatusTool),
     ]
 }
 
@@ -761,6 +764,95 @@ impl Tool for Setup {
     }
 }
 
+fn parse_name(args: &Value) -> Result<crate::server::home::InstanceName, ToolResult> {
+    let n = arg_str(args, "name")?;
+    crate::server::home::InstanceName::parse(&n).map_err(ToolResult::err)
+}
+
+struct Start;
+impl Tool for Start {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "arcus_start",
+            description: "Start a cache server instance created by arcus_setup. It runs under a detached supervisor that records \
+                how the server exits; returns once the server answers `version`.",
+            input_schema: json!({"type": "object", "properties": {"name": {"type": "string", "description": "Instance name"}}, "required": ["name"]}),
+        }
+    }
+    fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
+        let name = try_arg!(parse_name(args));
+        match crate::server::supervise::start(&ctx.home, &name) {
+            Ok(pid) => ToolResult::ok(format!("Instance `{}` is running (pid {pid}).", name.as_str()),
+                Some(json!({"name": name.as_str(), "pid": pid}))),
+            Err(e) => ToolResult::err(format!("arcus_start failed: {e}")),
+        }
+    }
+}
+
+struct Stop;
+impl Tool for Stop {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "arcus_stop",
+            description: "Stop a cache server instance with SIGTERM (waits up to 10 s). If it is still running, ask the user \
+                before calling again with force=true, which sends SIGKILL.",
+            input_schema: json!({"type": "object", "properties": {
+                "name": {"type": "string", "description": "Instance name"},
+                "force": {"type": "boolean", "description": "Send SIGKILL if SIGTERM did not stop it (default false); only after the user agrees"}
+            }, "required": ["name"]}),
+        }
+    }
+    fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
+        use crate::server::supervise::StopOutcome::*;
+        let name = try_arg!(parse_name(args));
+        match crate::server::supervise::stop(&ctx.home, &name, arg_bool(args, "force", false)) {
+            Ok(o) => {
+                let outcome = match o { Stopped => "stopped", StillRunning => "still_running", Killed => "killed", NotRunning => "not_running" };
+                let text = match o {
+                    Stopped => format!("Instance `{}` stopped.", name.as_str()),
+                    Killed => format!("Instance `{}` was killed with SIGKILL.", name.as_str()),
+                    NotRunning => format!("Instance `{}` is not running.", name.as_str()),
+                    StillRunning => format!("Instance `{}` did not stop within 10 s of SIGTERM. Ask the user whether to force it; \
+                        only if they agree, call arcus_stop again with force=true (SIGKILL).", name.as_str()),
+                };
+                ToolResult::ok(text, Some(json!({"outcome": outcome})))
+            }
+            Err(e) => ToolResult::err(format!("arcus_stop failed: {e}")),
+        }
+    }
+}
+
+struct StatusTool;
+impl Tool for StatusTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "arcus_status",
+            description: "Show whether cache server instances are running and responding, with the last recorded exit \
+                (exit code or signal). Omit name to list all instances.",
+            input_schema: json!({"type": "object", "properties": {"name": {"type": "string", "description": "Instance name (default: all)"}}}),
+        }
+    }
+    fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
+        let name = match arg_opt_str(args, "name") {
+            Some(n) => Some(try_arg!(crate::server::home::InstanceName::parse(&n).map_err(ToolResult::err))),
+            None => None,
+        };
+        match crate::server::supervise::status(&ctx.home, name.as_ref()) {
+            Ok(list) => {
+                let text = if list.is_empty() { "No instances.".to_string() } else {
+                    list.iter().map(|s| format!("{}: {}, port {}, responding={}{}", s.name,
+                        if s.running { format!("running (pid {})", s.pid.unwrap_or(0)) } else { "stopped".into() },
+                        s.port, s.responding,
+                        s.last_exit.as_ref().map(|e| format!(", last exit {} code={:?} signal={:?}", e.time, e.code, e.signal)).unwrap_or_default()))
+                        .collect::<Vec<_>>().join("\n")
+                };
+                ToolResult::ok(text, Some(json!({"instances": list})))
+            }
+            Err(e) => ToolResult::err(format!("arcus_status failed: {e}")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,7 +891,7 @@ mod tests {
     #[test]
     fn registry_has_no_delete_and_expected_tools() {
         let names: Vec<_> = registry().iter().map(|t| t.spec().name).collect();
-        for n in ["memcached_command", "zk_ls", "zk_get", "zk_create", "zk_set", "zk_password", "arcus_zk_start", "arcus_zk_stop"] {
+        for n in ["memcached_command", "zk_ls", "zk_get", "zk_create", "zk_set", "zk_password", "arcus_zk_start", "arcus_zk_stop", "arcus_start", "arcus_stop", "arcus_status"] {
             assert!(names.contains(&n), "{n}");
         }
         assert!(!names.iter().any(|n| n.contains("delete")));
