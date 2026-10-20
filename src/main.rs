@@ -73,10 +73,22 @@ struct Args {
     /// Supervise a server instance (internal)
     #[arg(long, hide = true, value_name = "NAME")]
     supervise: Option<String>,
+
+    /// Answer an ssh password prompt with a GUI dialog (internal; ssh's askpass protocol)
+    #[arg(long, hide = true, value_name = "PROMPT")]
+    askpass: Option<String>,
 }
 
 fn main() -> rustyline::Result<()> {
+    /* ssh runs the SSH_ASKPASS program with the prompt as its only argument. */
+    if std::env::var_os("ARCUS_ASKPASS").is_some() {
+        let prompt = std::env::args().nth(1).unwrap_or_default();
+        std::process::exit(remote::ssh::askpass_main(&prompt));
+    }
     let args = Args::parse();
+    if let Some(prompt) = &args.askpass {
+        std::process::exit(remote::ssh::askpass_main(prompt));
+    }
 
     if args.mcp || args.job.is_some() || args.call.is_some() || args.supervise.is_some() {
         let home = match server::home::Home::new(args.home.clone()) {
