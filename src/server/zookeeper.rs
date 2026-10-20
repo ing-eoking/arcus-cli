@@ -186,8 +186,30 @@ pub fn valid_version(v: &str) -> bool {
 }
 
 fn ensemble_file(home: &Home) -> PathBuf { home.zk_dir().join("ensemble.json") }
-fn node_dir(home: &Home, id: u32) -> PathBuf { home.zk_dir().join(format!("node{id}")) }
-fn pid_file(home: &Home, id: u32) -> PathBuf { node_dir(home, id).join("zookeeper.pid") }
+pub fn node_dir(home: &Home, id: u32) -> PathBuf { home.zk_dir().join(format!("node{id}")) }
+/// Pid of the node's java process, written by its `--supervise-zk` supervisor.
+fn pid_file(home: &Home, id: u32) -> PathBuf { node_dir(home, id).join("server.pid") }
+/// Per-node pid file of nodes started (without a supervisor) by an older arcus-cli.
+fn old_node_pid_file(home: &Home, id: u32) -> PathBuf { node_dir(home, id).join("zookeeper.pid") }
+fn launch_file(home: &Home, id: u32) -> PathBuf { node_dir(home, id).join("launch.json") }
+fn node_pid(home: &Home, id: u32) -> Option<u32> {
+    live_pid_in(&pid_file(home, id)).or_else(|| live_pid_in(&old_node_pid_file(home, id)))
+}
+
+/// How the supervisor of a node runs java (written by `start`, read by `supervise_zk`).
+#[derive(Serialize, Deserialize)]
+struct Launch { java: PathBuf, args: Vec<String> }
+
+/// Entry point of `arcus-cli --supervise-zk <id>`: runs java for node `id` and records how it exited.
+pub fn supervise_zk(home: &Home, id: u32) -> io::Result<()> {
+    let dir = node_dir(home, id);
+    let launch: Launch = serde_json::from_slice(&std::fs::read(launch_file(home, id))?)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", launch_file(home, id).display())))?;
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("zookeeper.log"))?;
+    let mut cmd = Command::new(&launch.java);
+    cmd.args(&launch.args);
+    super::supervise::run_supervised(&dir, cmd, log)
+}
 /// Pid file of the old single-node layout (before ensembles).
 fn legacy_pid_file(home: &Home) -> PathBuf { home.zk_dir().join("zookeeper.pid") }
 
@@ -242,6 +264,7 @@ fn ensure_bindable(port: u16) -> io::Result<()> {
     std::net::TcpListener::bind(("127.0.0.1", port)).map(drop).map_err(|e| busy(&e.to_string()))
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Started { pub ensemble: Ensemble, pub pids: Vec<Option<u32>>, pub already_running: bool }
 
 fn kill_pid(pid: u32) { let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).stdin(Stdio::null()).status(); }
@@ -263,7 +286,7 @@ pub fn start(home: &Home, nodes: &[Node], version: &str) -> io::Result<Started> 
         return Err(io::Error::other("a ZooKeeper from an older arcus-cli layout is still running; call arcus_zk_stop first"));
     }
     if let Some(e) = read_ensemble(home) {
-        let pids: Vec<Option<u32>> = e.nodes.iter().map(|n| live_pid_in(&pid_file(home, n.id))).collect();
+        let pids: Vec<Option<u32>> = e.nodes.iter().map(|n| node_pid(home, n.id)).collect();
         if pids.iter().any(Option::is_some) { return Ok(Started { ensemble: e, pids, already_running: true }); }
     }
     if !valid_version(version) { return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid ZooKeeper version `{version}`"))); }
@@ -275,6 +298,8 @@ pub fn start(home: &Home, nodes: &[Node], version: &str) -> io::Result<Started> 
     }
     let java = find_java(home).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no Java 8+ found"))?;
     let ensemble = Ensemble { version: version.to_string(), nodes: nodes.to_vec() };
+    let exe = std::env::current_exe()?;
+    // (node id, its supervisor process)
     let mut children: Vec<(u32, std::process::Child)> = Vec::new();
     let result = (|| -> io::Result<()> {
         for n in nodes {
@@ -284,20 +309,32 @@ pub fn start(home: &Home, nodes: &[Node], version: &str) -> io::Result<Started> 
             if nodes.len() > 1 { std::fs::write(data.join("myid"), n.id.to_string())?; }
             let cfg = dir.join("zoo.cfg");
             std::fs::write(&cfg, zoo_cfg(n, nodes, &data))?;
+            let launch = Launch { java: java.clone(), args: vec!["-cp".into(), format!("{}/lib/*", dist.display()),
+                "org.apache.zookeeper.server.quorum.QuorumPeerMain".into(), cfg.display().to_string()] };
+            std::fs::write(launch_file(home, n.id), serde_json::to_vec_pretty(&launch).map_err(io::Error::other)?)?;
+            let _ = std::fs::remove_file(dir.join("last_exit.json"));
+            let _ = std::fs::remove_file(old_node_pid_file(home, n.id));
             let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("zookeeper.log"))?;
-            let child = Command::new(&java)
-                .arg("-cp").arg(format!("{}/lib/*", dist.display()))
-                .arg("org.apache.zookeeper.server.quorum.QuorumPeerMain").arg(&cfg)
+            let child = Command::new(&exe)
+                .args(["--supervise-zk", &n.id.to_string(), "--home"]).arg(&home.root)
                 .process_group(0).stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log).spawn()?;
-            std::fs::write(pid_file(home, n.id), child.id().to_string())?;
             children.push((n.id, child));
         }
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             for (id, child) in children.iter_mut() {
-                if let Ok(Some(st)) = child.try_wait() {
+                // Err: someone else (the agent's reaper) already collected the exited supervisor.
+                let gone = !matches!(child.try_wait(), Ok(None)) || node_dir(home, *id).join("last_exit.json").exists();
+                if gone {
                     let logp = node_dir(home, *id).join("zookeeper.log");
-                    return Err(io::Error::other(format!("ZooKeeper node {id} exited ({st}); see {}\n{}",
+                    let how = std::fs::read_to_string(node_dir(home, *id).join("last_exit.json")).ok()
+                        .and_then(|t| serde_json::from_str::<super::supervise::ExitRecord>(&t).ok())
+                        .map(|r| match (r.code, r.signal) {
+                            (Some(c), _) => format!("exit code {c}"),
+                            (_, Some(sig)) => format!("signal {sig}"),
+                            _ => "exit status unknown".into(),
+                        }).unwrap_or_else(|| "its supervisor exited".into());
+                    return Err(io::Error::other(format!("ZooKeeper node {id} exited ({how}); see {}\n{}",
                         logp.display(), super::jobs::tail(&logp, 20).unwrap_or_default())));
                 }
             }
@@ -312,14 +349,18 @@ pub fn start(home: &Home, nodes: &[Node], version: &str) -> io::Result<Started> 
     })();
     match result {
         Ok(()) => {
-            let pids = children.iter().map(|(_, c)| Some(c.id())).collect();
+            let pids = nodes.iter().map(|n| node_pid(home, n.id)).collect();
             for (_, mut c) in children { std::thread::spawn(move || { let _ = c.wait(); }); }
             write_ensemble(home, &ensemble)?;
             Ok(Started { ensemble, pids, already_running: false })
         }
         Err(e) => {
             for (id, mut c) in children {
-                kill_pid(c.id());
+                // Stop java first: its supervisor then records the exit and leaves by itself.
+                match live_pid_in(&pid_file(home, id)) {
+                    Some(pid) => { kill_pid(pid); wait_exit(pid, 5); }
+                    None => if matches!(c.try_wait(), Ok(None)) { kill_pid(c.id()) },
+                }
                 let _ = c.wait();
                 let _ = std::fs::remove_file(pid_file(home, id));
             }
@@ -332,7 +373,8 @@ pub fn start(home: &Home, nodes: &[Node], version: &str) -> io::Result<Started> 
 /// Stops every node of the local ensemble (and a leftover single-node ZooKeeper of the old layout).
 /// Pid files and `ensemble.json` are removed; data stays. Returns the number of processes stopped.
 pub fn stop(home: &Home) -> io::Result<usize> {
-    let mut files: Vec<PathBuf> = read_ensemble(home).map(|e| e.nodes.iter().map(|n| pid_file(home, n.id)).collect()).unwrap_or_default();
+    let mut files: Vec<PathBuf> = read_ensemble(home)
+        .map(|e| e.nodes.iter().flat_map(|n| [pid_file(home, n.id), old_node_pid_file(home, n.id)]).collect()).unwrap_or_default();
     files.push(legacy_pid_file(home));
     let mut seen_any = ensemble_file(home).exists();
     let mut stopped = 0;

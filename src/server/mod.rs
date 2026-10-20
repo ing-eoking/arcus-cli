@@ -9,3 +9,4 @@ pub mod jobs;
 pub mod release;
 pub mod zookeeper;
 pub mod supervise;
+pub mod agent;

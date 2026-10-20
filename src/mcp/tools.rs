@@ -536,7 +536,7 @@ impl Tool for ZkStart {
                 };
             }
         }
-        match zk::start(&ctx.home, &nodes, &version) {
+        match crate::server::agent::zk_start(&ctx.home, &nodes, &version) {
             Ok(st) => {
                 let ensemble = st.ensemble.connect_string();
                 let list: Vec<Value> = st.ensemble.nodes.iter().zip(&st.pids).map(|(n, pid)| json!({
@@ -568,7 +568,7 @@ impl Tool for ZkStop {
         }
     }
     fn call(&self, ctx: &Ctx, _args: &Value) -> ToolResult {
-        match crate::server::zookeeper::stop(&ctx.home) {
+        match crate::server::agent::zk_stop(&ctx.home) {
             Ok(n) => ToolResult::ok(format!("Stopped the local ZooKeeper ({n} process(es))."), Some(json!({"stopped": n}))),
             Err(e) => ToolResult::err(format!("arcus_zk_stop failed: {e}")),
         }
@@ -847,7 +847,7 @@ impl Tool for Start {
     }
     fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
         let name = try_arg!(parse_name(args));
-        match crate::server::supervise::start(&ctx.home, &name) {
+        match crate::server::agent::start(&ctx.home, &name) {
             Ok(pid) => ToolResult::ok(format!("Instance `{}` is running (pid {pid}).", name.as_str()),
                 Some(json!({"name": name.as_str(), "pid": pid}))),
             Err(e) => ToolResult::err(format!("arcus_start failed: {e}")),
@@ -871,7 +871,7 @@ impl Tool for Stop {
     fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
         use crate::server::supervise::StopOutcome::*;
         let name = try_arg!(parse_name(args));
-        match crate::server::supervise::stop(&ctx.home, &name, arg_bool(args, "force", false)) {
+        match crate::server::agent::stop(&ctx.home, &name, arg_bool(args, "force", false)) {
             Ok(o) => {
                 let outcome = match o { Stopped => "stopped", StillRunning => "still_running", Killed => "killed", NotRunning => "not_running" };
                 let text = match o {
@@ -903,13 +903,14 @@ impl Tool for StatusTool {
             Some(n) => Some(try_arg!(crate::server::home::InstanceName::parse(&n).map_err(ToolResult::err))),
             None => None,
         };
-        match crate::server::supervise::status(&ctx.home, name.as_ref()) {
+        match crate::server::agent::status(&ctx.home, name.as_ref()) {
             Ok(list) => {
                 let text = if list.is_empty() { "No instances.".to_string() } else {
                     list.iter().map(|s| format!("{}: {}, port {}, responding={}{}", s.name,
                         if s.running { format!("running (pid {})", s.pid.unwrap_or(0)) } else { "stopped".into() },
                         s.port, s.responding,
-                        s.last_exit.as_ref().map(|e| format!(", last exit {} code={:?} signal={:?}", e.time, e.code, e.signal)).unwrap_or_default()))
+                        s.last_exit.as_ref().map(|e| format!(", last exit {} code={:?} signal={:?}{}", e.time, e.code, e.signal,
+                            e.note.as_ref().map(|n| format!(" ({n})")).unwrap_or_default())).unwrap_or_default()))
                         .collect::<Vec<_>>().join("\n")
                 };
                 ToolResult::ok(text, Some(json!({"instances": list})))
