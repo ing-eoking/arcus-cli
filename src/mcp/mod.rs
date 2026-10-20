@@ -1,4 +1,5 @@
 //! Minimal synchronous MCP server over stdio: one JSON-RPC message per line.
+pub mod remote_tools;
 pub mod tools;
 
 use crate::server::home::Home;
