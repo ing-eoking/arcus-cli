@@ -14,7 +14,7 @@ const MAX_BYTES: usize = 1 << 20;
 
 /// All tools exposed by `arcus-cli --mcp` (later tasks append here).
 pub fn registry() -> Vec<Box<dyn Tool>> {
-    vec![
+    let mut v: Vec<Box<dyn Tool>> = vec![
         Box::new(MemcachedCommand),
         Box::new(ZkLs),
         Box::new(ZkGet),
@@ -33,7 +33,9 @@ pub fn registry() -> Vec<Box<dyn Tool>> {
         Box::new(Start),
         Box::new(Stop),
         Box::new(StatusTool),
-    ]
+    ];
+    v.extend(super::remote_tools::registry());
+    v
 }
 
 macro_rules! try_arg {
