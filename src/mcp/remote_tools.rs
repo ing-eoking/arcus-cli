@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 pub fn registry() -> Vec<Box<dyn Tool>> {
-    vec![Box::new(HostListSshConfig), Box::new(HostAdd), Box::new(HostList), Box::new(HostCheck)]
+    vec![Box::new(HostListSshConfig), Box::new(HostAdd), Box::new(HostList), Box::new(HostCheck), Box::new(HostInstall)]
 }
 
 fn ssh_config_path() -> PathBuf {
@@ -201,6 +201,36 @@ and call again with accept_host_key: true only after the user confirms.",
         }
     }
     fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult { host_check(&ctx.home, &SystemRunner, &ssh_config_path(), args) }
+}
+
+struct HostInstall;
+impl Tool for HostInstall {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "arcus_host_install",
+            description: "Copy arcus-cli to a machine and keep its resident agent running (systemd user service / launchd, or a daemon). \
+Without apply it only returns a plan: show it to the user and call again with apply: true after they agree. \
+If an agent already runs there, it stops and returns its version and managed servers: ask the user, then use replace: true \
+(only the agent is replaced; servers keep running). On Linux, service mode needs linger; if it is refused, ask the user to choose \
+mode: \"daemon\" or an administrator running `sudo loginctl enable-linger <user>`. Never run sudo.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "machine": {"type": "string", "description": "Machine name"},
+                    "mode": {"type": "string", "enum": ["service", "daemon"], "description": "How the agent stays up (recommended service)"},
+                    "tag": {"type": "string", "description": "Release tag to install (recommended: this build's tag)"},
+                    "binary": {"type": "string", "description": "Local arcus-cli binary to ship instead of a release (development)"},
+                    "replace": {"type": "boolean", "description": "Replace a running agent (default false)"},
+                    "apply": {"type": "boolean", "description": "Perform the install (default false: plan only)"},
+                    "accept_host_key": {"type": "boolean", "description": "Accept a new host key (only after the user confirmed the fingerprint)"}
+                },
+                "required": ["machine"]
+            }),
+        }
+    }
+    fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
+        crate::remote::install::host_install(&ctx.home, &SystemRunner, &ssh_config_path(), args, std::time::Duration::from_secs(1))
+    }
 }
 
 #[cfg(test)]

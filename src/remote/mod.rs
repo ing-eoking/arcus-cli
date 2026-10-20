@@ -2,5 +2,6 @@
 #![allow(dead_code)]
 pub mod dist;
 pub mod forward;
+pub mod install;
 pub mod machines;
 pub mod ssh;
