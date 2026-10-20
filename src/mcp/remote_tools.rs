@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 pub fn registry() -> Vec<Box<dyn Tool>> {
-    vec![Box::new(HostListSshConfig), Box::new(HostAdd), Box::new(HostList), Box::new(HostCheck), Box::new(HostInstall), Box::new(ClusterZkPlan), Box::new(ClusterZkStart)]
+    vec![Box::new(HostListSshConfig), Box::new(HostAdd), Box::new(HostList), Box::new(HostCheck), Box::new(HostInstall), Box::new(ClusterZkPlan), Box::new(ClusterZkStart), Box::new(ClusterStatus)]
 }
 
 fn ssh_config_path() -> PathBuf {
@@ -424,6 +424,55 @@ every node serves. If ZooKeeper must be downloaded first, returns jobs to poll, 
     }
 }
 
+/// Forwards `arcus_status` to every machine in parallel; one machine's failure does not hide the others.
+pub fn cluster_status(args: &Value, defaults: Vec<String>, fwd: &(dyn Fn(&str, &Value, &str) -> ToolResult + Sync)) -> ToolResult {
+    let names: Vec<String> = match args.get("machines").and_then(Value::as_array) {
+        Some(a) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+        None => defaults,
+    };
+    if names.is_empty() {
+        return ToolResult::err("no machines: register one with arcus_host_add or pass `machines` (ssh config aliases are accepted)");
+    }
+    let results: Vec<ToolResult> = std::thread::scope(|sc| {
+        let handles: Vec<_> = names.iter().map(|m| sc.spawn(move || fwd("arcus_status", &json!({}), m))).collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| ToolResult::err("status thread panicked"))).collect()
+    });
+    let entries: Vec<Value> = names.iter().zip(results).map(|(m, r)| {
+        if r.is_error { json!({"machine": m, "error": r.text}) }
+        else {
+            let inst = r.structured.as_ref().and_then(|s| s.get("instances")).cloned().unwrap_or_else(|| json!([]));
+            json!({"machine": m, "instances": inst})
+        }
+    }).collect();
+    let text = entries.iter().map(|e| match e.get("error") {
+        Some(err) => format!("{}: ERROR {}", e["machine"].as_str().unwrap_or(""), err.as_str().unwrap_or("")),
+        None => format!("{}: {} instance(s)", e["machine"].as_str().unwrap_or(""), e["instances"].as_array().map_or(0, Vec::len)),
+    }).collect::<Vec<_>>().join("\n");
+    ToolResult::ok(text, Some(json!({"machines": entries})))
+}
+
+struct ClusterStatus;
+impl Tool for ClusterStatus {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "arcus_cluster_status",
+            description: "Run arcus_status on every registered machine in parallel and return {machines: [{machine, instances | error}]}. \
+Defaults to the machines registered with arcus_host_add; ssh-config aliases that are not registered can be passed explicitly in `machines`.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "machines": {"type": "array", "items": {"type": "string"}, "description": "Machine names (recommended: all registered machines)"}
+                }
+            }),
+        }
+    }
+    fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
+        let defaults = load_machines(&ctx.home).map(|v| v.into_iter().map(|m| m.name).collect()).unwrap_or_default();
+        let fwd = |tool: &str, a: &Value, machine: &str| forward(ctx, tool, a, machine, &SystemRunner);
+        cluster_status(args, defaults, &fwd)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,5 +648,21 @@ mod tests {
         let r = cluster_zk_start(&start_args(), &fwd, std::time::Duration::from_millis(30), std::time::Duration::from_millis(5));
         assert!(!r.is_error);
         assert_eq!(r.structured.unwrap()["jobs"][2], json!({"machine": "c", "job_id": "j-c"}));
+    }
+
+    #[test]
+    fn cluster_status_runs_in_parallel() {
+        let fwd = |_t: &str, _a: &Value, m: &str| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            if m == "c" { ToolResult::err("unreachable") }
+            else { ToolResult::ok("ok", Some(json!({"instances": [{"name": "x"}]}))) }
+        };
+        let t = std::time::Instant::now();
+        let r = cluster_status(&json!({}), vec!["a".into(), "b".into(), "c".into()], &fwd);
+        assert!(t.elapsed() < std::time::Duration::from_millis(700), "{:?}", t.elapsed());
+        let ms = r.structured.unwrap()["machines"].clone();
+        assert_eq!(ms[0]["machine"], "a");
+        assert_eq!(ms[0]["instances"][0]["name"], "x");
+        assert_eq!(ms[2]["error"], "unreachable");
     }
 }
