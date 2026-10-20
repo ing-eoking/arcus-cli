@@ -173,7 +173,7 @@ fn scram_sha256_with_salt(password: &str, salt: &[u8]) -> String {
 }
 
 /// Same as [`scram_sha256_with_salt`] but generates a fresh random salt.
-fn scram_sha256(password: &str) -> String {
+pub(crate) fn scram_sha256(password: &str) -> String {
     use ring::rand::{SecureRandom, SystemRandom};
     let mut salt = [0u8; SCRAM_SALT_LEN];
     SystemRandom::new().fill(&mut salt).expect("secure RNG failure");

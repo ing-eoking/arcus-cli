@@ -1,6 +1,8 @@
 pub mod build;
 pub mod features;
 pub mod home;
+pub mod instance;
+pub mod znode;
 pub mod secret;
 pub mod fetch;
 pub mod jobs;
