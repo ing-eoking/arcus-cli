@@ -354,12 +354,19 @@ impl Tool for EeLogin {
         ToolSpec {
             name: "arcus_ee_login",
             description: "Start a GitHub browser (device) login to get access to the private EE sources. Returns a one-time \
-                code and URL; show both to the user, who approves in a browser. No token passes through this conversation.",
-            input_schema: json!({"type": "object", "properties": {}}),
+                code and URL; show both to the user, who approves in a browser. No token passes through this conversation. \
+                On a Linux machine without a keyring, gh would store the token in plain text, so ask the user first and pass accept_plaintext_token: true.",
+            input_schema: json!({"type": "object", "properties": {
+                "accept_plaintext_token": {"type": "boolean", "description": "Allow gh to store the token in ~/.config/gh/hosts.yml (mode 600) when there is no keyring (default false)"}
+            }}),
         }
     }
-    fn call(&self, ctx: &Ctx, _args: &Value) -> ToolResult {
+    fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
         use crate::server::jobs::{self, JobKind, JobSpec};
+        let has_dbus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty());
+        if plaintext_consent_needed(std::env::consts::OS, has_dbus, on_path("secret-tool"), arg_bool(args, "accept_plaintext_token", false)) {
+            return plaintext_consent_error();
+        }
         // The job downloads gh itself when it is missing, so this call never blocks on that download.
         let id = match jobs::submit(&ctx.home, JobSpec { kind: JobKind::EeLogin, params: json!({}) }) {
             Ok(id) => id,
@@ -377,6 +384,16 @@ impl Tool for EeLogin {
             Err(e) => ToolResult::err(format!("login job {id}: {e}")),
         }
     }
+}
+
+/// True on Linux without a keyring (no D-Bus session and no `secret-tool`) when the user has not consented to a plain-text token.
+fn plaintext_consent_needed(os: &str, has_dbus: bool, has_secret_tool: bool, accepted: bool) -> bool {
+    os == "linux" && !has_dbus && !has_secret_tool && !accepted
+}
+
+fn plaintext_consent_error() -> ToolResult {
+    ToolResult::err("this machine has no keyring, so gh will store the GitHub token in plain text in ~/.config/gh/hosts.yml (mode 600). \
+Ask the user whether that is acceptable; only if they agree, call arcus_ee_login again with accept_plaintext_token: true.")
 }
 
 /// Reply for the login job's current status: the code once published, a failure, or (`timed_out`) a poll instruction.
@@ -1079,6 +1096,17 @@ mod tests {
             id: "ee_login-1".into(), kind: crate::server::jobs::JobKind::EeLogin, state, step: step.into(),
             message: "boom".into(), log: std::path::PathBuf::from("/nonexistent/job.log"), result, pid: None,
         }
+    }
+
+    #[test]
+    fn ee_login_requires_plaintext_consent_without_keyring() {
+        assert!(plaintext_consent_needed("linux", false, false, false));
+        assert!(!plaintext_consent_needed("linux", false, false, true));
+        assert!(!plaintext_consent_needed("linux", true, false, false));
+        assert!(!plaintext_consent_needed("linux", false, true, false));
+        assert!(!plaintext_consent_needed("macos", false, false, false));
+        let r = plaintext_consent_error();
+        assert!(r.is_error && r.text.contains("hosts.yml") && r.text.contains("accept_plaintext_token"), "{}", r.text);
     }
 
     #[test]
