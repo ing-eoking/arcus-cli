@@ -65,6 +65,8 @@ pub fn common_opts(home: &Home) -> Vec<String> {
         format!("ControlPath={}/%C", dir.display()),
         "ControlPersist=10m".to_string(),
         "ConnectTimeout=15".to_string(),
+        "ServerAliveInterval=15".to_string(),
+        "ServerAliveCountMax=4".to_string(),
     ] {
         v.push("-o".to_string());
         v.push(o);
@@ -128,6 +130,8 @@ pub fn askpass_main(prompt: &str) -> i32 {
 #[derive(Debug)]
 pub enum SshError {
     HostKeyUnknown { fingerprint: String },
+    /// The key cannot be shown reliably (jump host / proxy command, or no fingerprint): the user must verify it in a terminal.
+    HostKeyManual { label: String },
     HostKeyChanged,
     AuthFailed { hint: String },
     Unreachable(String),
@@ -217,18 +221,21 @@ impl Ssh<'_> {
         a
     }
 
-    /// Where `ssh -G` says this machine really connects (for host key lookups).
-    fn resolve_endpoint(&self) -> Option<(String, u16)> {
+    /// Where `ssh -G` says this machine really connects (for host key lookups), and whether it goes through a proxy.
+    fn resolve_endpoint(&self) -> Option<(String, u16, bool)> {
         let mut args = vec!["-G".to_string()];
         args.extend(self.machine.ssh_destination());
         let out = self.runner.run("ssh", &args, &[], &[]).ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
-        let (mut host, mut port) = (None, 22u16);
+        let (mut host, mut port, mut proxied) = (None, 22u16, false);
         for line in text.lines() {
             if let Some(h) = line.strip_prefix("hostname ") { host = Some(h.trim().to_string()); }
             if let Some(p) = line.strip_prefix("port ") { port = p.trim().parse().unwrap_or(22); }
+            for key in ["proxyjump ", "proxycommand "] {
+                if let Some(v) = line.strip_prefix(key) && !v.trim().eq_ignore_ascii_case("none") && !v.trim().is_empty() { proxied = true; }
+            }
         }
-        host.map(|h| (h, port))
+        host.map(|h| (h, port, proxied))
     }
 
     fn finish(&self, out: SshOutput) -> Result<SshOutput, SshError> {
@@ -236,10 +243,13 @@ impl Ssh<'_> {
         if out.status != 255 { return Ok(out); }
         match classify(&out.stderr, out.status, &self.label()) {
             Some(SshError::HostKeyUnknown { .. }) => {
-                let fp = self.resolve_endpoint()
-                    .and_then(|(h, p)| fingerprint(self.runner, &h, p).ok())
-                    .unwrap_or_else(|| "unavailable".to_string());
-                Err(SshError::HostKeyUnknown { fingerprint: fp })
+                match self.resolve_endpoint() {
+                    Some((h, p, false)) => match fingerprint(self.runner, &h, p) {
+                        Ok(fp) => Err(SshError::HostKeyUnknown { fingerprint: fp }),
+                        Err(_) => Err(SshError::HostKeyManual { label: self.label() }),
+                    },
+                    _ => Err(SshError::HostKeyManual { label: self.label() }),
+                }
             }
             Some(e) => Err(e),
             None => Err(SshError::Remote { status: out.status, stderr: out.stderr }),
@@ -271,7 +281,8 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    struct Fake { calls: RefCell<Vec<(String, Vec<String>, Vec<(String, String)>)>>, reply: RefCell<Vec<SshOutput>> }
+    type Call = (String, Vec<String>, Vec<(String, String)>);
+    struct Fake { calls: RefCell<Vec<Call>>, reply: RefCell<Vec<SshOutput>> }
     impl Fake {
         fn new(reply: Vec<SshOutput>) -> Fake { Fake { calls: RefCell::new(vec![]), reply: RefCell::new(reply) } }
     }
@@ -369,6 +380,43 @@ mod tests {
         let calls = fake.calls.borrow();
         assert_eq!(calls[2].1, ["-p", "2200", "10.0.0.5"]);
         let _ = std::fs::remove_dir_all(&home.root);
+    }
+
+    fn unknown_key_replies(g: &str, rest: Vec<SshOutput>) -> Vec<SshOutput> {
+        let mut v = vec![
+            SshOutput { status: 255, stdout: vec![], stderr: "Host key verification failed.".into() },
+            SshOutput { status: 0, stdout: g.as_bytes().to_vec(), stderr: String::new() },
+        ];
+        v.extend(rest);
+        v
+    }
+
+    #[test]
+    fn proxied_or_unavailable_fingerprint_needs_manual_verification() {
+        let home = tmp_home("manual");
+        let m = alias("dev-1");
+        // ProxyJump set: never keyscan the direct address, never offer accept_host_key
+        let fake = Fake::new(unknown_key_replies("hostname 10.0.0.5\nport 22\nproxyjump bastion\n", vec![]));
+        let ssh = Ssh { home: &home, runner: &fake, machine: &m, policy: HostKeyPolicy::Strict };
+        assert!(matches!(ssh.exec("true", b""), Err(SshError::HostKeyManual { ref label }) if label == "dev-1"));
+        assert_eq!(fake.calls.borrow().len(), 2);
+        // ProxyCommand set
+        let fake = Fake::new(unknown_key_replies("hostname h\nproxycommand nc %h %p\n", vec![]));
+        let ssh = Ssh { home: &home, runner: &fake, machine: &m, policy: HostKeyPolicy::Strict };
+        assert!(matches!(ssh.exec("true", b""), Err(SshError::HostKeyManual { .. })));
+        // "proxyjump none" is no proxy but the scan returns nothing => fingerprint unavailable
+        let fake = Fake::new(unknown_key_replies("hostname h\nproxyjump none\nproxycommand none\n", vec![]));
+        let ssh = Ssh { home: &home, runner: &fake, machine: &m, policy: HostKeyPolicy::Strict };
+        assert!(matches!(ssh.exec("true", b""), Err(SshError::HostKeyManual { .. })));
+        let r = crate::remote::forward::ssh_error_result(SshError::HostKeyManual { label: "dev-1".into() });
+        assert!(r.is_error && r.text.contains("ssh dev-1") && r.text.contains("Do NOT use accept_host_key"), "{}", r.text);
+        let _ = std::fs::remove_dir_all(&home.root);
+    }
+
+    #[test]
+    fn keepalive_options_present() {
+        let o = common_opts(&tmp_home("ka"));
+        assert!(o.contains(&"ServerAliveInterval=15".to_string()) && o.contains(&"ServerAliveCountMax=4".to_string()));
     }
 
     #[test]

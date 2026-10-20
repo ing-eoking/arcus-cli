@@ -64,8 +64,13 @@ fn call_tool(tools: &[Box<dyn Tool>], ctx: &Ctx, name: &str, args: &Value) -> To
     }
 }
 
+static CALL_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// True once this process runs as `--call` (a remote forward: no one is at the keyboard).
+pub fn in_call_mode() -> bool { CALL_MODE.load(std::sync::atomic::Ordering::Relaxed) }
+
 /// Run one tool for `--call`: read a JSON object of arguments, write exactly one result line.
 pub fn run_call(tool: &str, mut input: impl io::Read, mut output: impl Write, tools: Vec<Box<dyn Tool>>, ctx: Ctx) -> io::Result<bool> {
+    CALL_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut buf = String::new();
     let res = match input.read_to_string(&mut buf) {
         Err(e) => ToolResult::err(format!("cannot read arguments: {e}")),
