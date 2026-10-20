@@ -109,8 +109,10 @@ pub fn parse_check(stdout: &str) -> Result<Value, String> {
             arcus_cli = json!({"version": version, "tag": tag});
         } else if let Some(v) = serde_json::from_str::<Value>(line).ok().filter(Value::is_object) {
             agent = json!({
-                "running": v.get("running").and_then(Value::as_bool).unwrap_or(true),
+                "running": v.get("running").and_then(Value::as_bool).unwrap_or(false),
                 "servers": v.get("servers").cloned().unwrap_or_else(|| json!([])),
+                "zk_nodes": v.get("zk_nodes").cloned().unwrap_or_else(|| json!([])),
+                "tag": v.get("tag").cloned().unwrap_or(Value::Null),
             });
         }
     }
@@ -130,7 +132,7 @@ pub fn host_check(home: &Home, runner: &dyn Runner, config: &Path, args: &Value)
         v["os"].as_str().unwrap_or("?"), v["arch"].as_str().unwrap_or("?"),
         v["target"].as_str().unwrap_or("unsupported"),
         if v["arcus_cli"].is_null() { "not installed" } else { "installed" },
-        if v["agent"].is_null() { "not running" } else { "running" });
+        if v["agent"]["running"].as_bool() == Some(true) { "running" } else { "not running" });
     ToolResult::ok(summary, Some(v))
 }
 
@@ -508,6 +510,21 @@ mod tests {
         let cfg = d.join("config");
         std::fs::write(&cfg, "Host dev-1\n  HostName 10.0.0.1\n").unwrap();
         (Home { root: d.join("home") }, cfg)
+    }
+
+    #[test]
+    fn parse_check_agent_running_defaults_false() {
+        let v = parse_check("Linux x86_64\n/home/u\n{\"servers\":[\"a\"],\"zk_nodes\":[1],\"tag\":\"v1\"}\n").unwrap();
+        assert_eq!(v["agent"]["running"], json!(false));
+        assert_eq!(v["agent"]["zk_nodes"], json!([1]));
+        assert_eq!(v["agent"]["tag"], json!("v1"));
+        let (home, cfg) = tmp("chk");
+        let fake = Fake::new(vec![out(0, "Linux x86_64\n/h\n{\"servers\":[]}\n", "")]);
+        let r = host_check(&home, &fake, &cfg, &json!({"machine": "dev-1"}));
+        assert!(r.text.ends_with("agent not running"), "{}", r.text);
+        let fake = Fake::new(vec![out(0, "Linux x86_64\n/h\n{\"running\":true,\"servers\":[]}\n", "")]);
+        let r = host_check(&home, &fake, &cfg, &json!({"machine": "dev-1"}));
+        assert!(r.text.ends_with("agent running"), "{}", r.text);
     }
 
     #[test]

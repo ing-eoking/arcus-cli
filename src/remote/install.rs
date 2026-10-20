@@ -50,6 +50,9 @@ pub fn daemon_command_for(os: &str, bin: &str, home: &str) -> String {
     format!("{setsid}nohup {bin} --agent --home {home} >> {home}/agent.log 2>&1 < /dev/null &")
 }
 
+/// Shell test that `$pid` really is an arcus-cli process (a stale pid file may name an unrelated process).
+const AGENT_IS_ARCUS: &str = "ps -p \"$pid\" -o comm= 2>/dev/null | grep -q arcus-cli";
+
 /// Stops the old agent however it was started (unit, launchd, or daemon); "not present" is fine.
 /// Never touches supervisors or servers.
 fn stop_old_agent(os: &str) -> String {
@@ -59,12 +62,12 @@ fn stop_old_agent(os: &str) -> String {
         "systemctl --user disable --now arcus-cli-agent 2>/dev/null || true"
     };
     format!("{managed}; pid=$(cat \"$HOME/.arcus-cli/agent.pid\" 2>/dev/null); \
-if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then kill \"$pid\" || true; fi; true")
+if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null && {AGENT_IS_ARCUS}; then kill \"$pid\" || true; fi; true")
 }
 
 /// Exit 0 when the old agent process is gone.
 const AGENT_GONE_CMD: &str = "pid=$(cat \"$HOME/.arcus-cli/agent.pid\" 2>/dev/null); \
-if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then exit 1; fi; exit 0";
+if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null && ps -p \"$pid\" -o comm= 2>/dev/null | grep -q arcus-cli; then exit 1; fi; exit 0";
 
 fn plan_steps(os: &str, mode: &str, replace: bool, has_agent: bool) -> Vec<String> {
     let mut s = vec![
@@ -95,6 +98,29 @@ would stop after logout. Nothing was installed. Ask the user to choose: (1) call
         detail.trim()))
 }
 
+/// What a binary header says it is built for: (format, architecture).
+fn binary_kind(head: &[u8]) -> Option<(&'static str, &'static str)> {
+    if head.len() >= 20 && head[..4] == [0x7f, b'E', b'L', b'F'] {
+        let m = if head[5] == 2 { u16::from_be_bytes([head[18], head[19]]) } else { u16::from_le_bytes([head[18], head[19]]) };
+        return Some(("ELF", match m { 62 => "x86_64", 183 => "aarch64", _ => "other" }));
+    }
+    if head.len() >= 8 && head[..4] == [0xcf, 0xfa, 0xed, 0xfe] {
+        return Some(("Mach-O", match u32::from_le_bytes([head[4], head[5], head[6], head[7]]) {
+            0x0100_0007 => "x86_64", 0x0100_000C => "aarch64", _ => "other" }));
+    }
+    None
+}
+
+/// A user-provided binary must match the machine's target triple (ELF vs Mach-O and architecture).
+fn check_binary_matches(head: &[u8], target: &str) -> Result<(), String> {
+    let want = (if target.contains("linux") { "ELF" } else { "Mach-O" }, target.split('-').next().unwrap_or(""));
+    match binary_kind(head) {
+        Some((f, a)) if (f, a) == want => Ok(()),
+        Some((f, a)) => Err(format!("the provided binary is a {f} {a} executable but the machine needs {} {} ({target})", want.0, want.1)),
+        None => Err(format!("the provided binary is not a recognizable ELF or Mach-O executable; the machine needs {} {} ({target})", want.0, want.1)),
+    }
+}
+
 fn safe_home(h: &str) -> bool {
     !h.is_empty() && h.starts_with('/') && h.chars().all(|c| c.is_ascii_alphanumeric() || "/_.-".contains(c))
 }
@@ -116,15 +142,15 @@ pub fn host_install(home: &Home, runner: &dyn Runner, config: &Path, args: &Valu
         return ToolResult::err(format!("`{name}` ({os} {}) is not a supported target", data["arch"].as_str().unwrap_or("?")));
     };
     let rhome = data["home"].as_str().unwrap_or("").to_string();
-    let has_agent = !data["agent"].is_null();
+    let has_agent = data["agent"]["running"].as_bool() == Some(true);
     if has_agent && !replace {
         let version = data["arcus_cli"]["version"].as_str().unwrap_or("unknown");
-        let tag = data["arcus_cli"]["tag"].as_str().unwrap_or("");
+        let tag = data["agent"]["tag"].as_str().or(data["arcus_cli"]["tag"].as_str()).unwrap_or("");
         return ToolResult::err(format!(
-            "an arcus-cli agent is already running on `{name}` (version {version} {tag}), managing servers: {}. \
+            "an arcus-cli agent is already running on `{name}` (version {version} {tag}), managing servers: {}, ZooKeeper nodes: {}. \
 Ask the user whether to replace it; if yes call again with replace: true. Replacing stops only the agent; \
 supervisors and servers keep running",
-            data["agent"]["servers"]));
+            data["agent"]["servers"], data["agent"]["zk_nodes"]));
     }
     let binary_arg = arg_opt_str(args, "binary");
     let tag_arg = arg_opt_str(args, "tag");
@@ -166,6 +192,12 @@ supervisors and servers keep running",
         Ok(v) => v,
         Err(e) => return ToolResult::err(e),
     };
+    if binary_arg.is_some() {
+        use std::io::Read;
+        let mut head = [0u8; 32];
+        let n = std::fs::File::open(&local).and_then(|mut f| f.read(&mut head)).unwrap_or(0);
+        if let Err(e) = check_binary_matches(&head[..n], &target) { return ToolResult::err(e); }
+    }
     /* Linger next: nothing is changed on the machine if it is refused. */
     if mode == "service" && os == "Linux" {
         let o = t!(run("loginctl show-user \"$(id -un)\" -p Linger; id -un", b""));
@@ -264,7 +296,10 @@ mod tests {
         let cfg = d.join("config");
         std::fs::write(&cfg, "Host dev-1\n  HostName 10.0.0.1\n").unwrap();
         let bin = d.join("arcus-cli");
-        std::fs::write(&bin, "x").unwrap();
+        let mut elf = vec![0x7f, b'E', b'L', b'F', 2, 1, 1, 0];
+        elf.resize(18, 0);
+        elf.extend([62, 0]); // e_machine x86_64
+        std::fs::write(&bin, elf).unwrap();
         (Home { root: d.join("home") }, cfg, bin)
     }
     const IDLE: &str = "Linux x86_64\n/home/u\narcus-cli 1.0.0 (v1)\n";
@@ -361,6 +396,39 @@ mod tests {
             &json!({"machine": "dev-1", "mode": "daemon", "replace": true, "apply": true, "binary": bin.to_str().unwrap()}), Duration::ZERO);
         assert!(r.is_error && r.text.contains("did not stop"), "{}", r.text);
         assert!(!cmds(&f).iter().any(|x| x.starts_with("setsid")));
+    }
+    #[test] fn binary_header_must_match_target() {
+        let mut elf = vec![0x7f, b'E', b'L', b'F', 2, 1, 1, 0];
+        elf.resize(18, 0);
+        elf.extend([183, 0]);
+        assert!(check_binary_matches(&elf, "aarch64-unknown-linux-gnu").is_ok());
+        let e = check_binary_matches(&elf, "x86_64-unknown-linux-gnu").unwrap_err();
+        assert!(e.contains("ELF aarch64") && e.contains("x86_64-unknown-linux-gnu"), "{e}");
+        let macho = [0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01];
+        assert!(check_binary_matches(&macho, "aarch64-apple-darwin").is_ok());
+        assert!(check_binary_matches(&macho, "x86_64-unknown-linux-gnu").unwrap_err().contains("Mach-O aarch64"));
+        assert!(check_binary_matches(b"x", "x86_64-apple-darwin").is_err());
+    }
+    #[test] fn install_rejects_mismatched_binary_before_scp() {
+        let (home, cfg, bin) = setup("mism");
+        std::fs::write(&bin, [0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01]).unwrap();
+        let f = fake(vec![("uname", o(0, IDLE, ""))]);
+        let r = host_install(&home, &f, &cfg,
+            &json!({"machine": "dev-1", "apply": true, "binary": bin.to_str().unwrap()}), Duration::ZERO);
+        assert!(r.is_error && r.text.contains("Mach-O aarch64") && r.text.contains("ELF x86_64"), "{}", r.text);
+        assert!(!f.calls.borrow().iter().any(|(p, _)| p == "scp"));
+    }
+    #[test] fn old_agent_is_killed_only_if_arcus_cli() {
+        let c = stop_old_agent("Linux");
+        assert!(c.contains("ps -p \"$pid\" -o comm=") && c.contains("grep -q arcus-cli") && c.contains("kill \"$pid\""));
+        assert!(AGENT_GONE_CMD.contains("grep -q arcus-cli"));
+    }
+    #[test] fn refusal_lists_servers_zk_nodes_and_tag() {
+        let (home, cfg, _) = setup("refuse");
+        let out = "Linux x86_64\n/home/u\narcus-cli 1.0.0 (v1)\n{\"running\":true,\"servers\":[\"svc-a\"],\"zk_nodes\":[{\"id\":2}],\"tag\":\"v9\"}\n";
+        let f = fake(vec![("uname", o(0, out, ""))]);
+        let r = host_install(&home, &f, &cfg, &json!({"machine": "dev-1", "apply": true}), Duration::ZERO);
+        assert!(r.is_error && r.text.contains("svc-a") && r.text.contains("\"id\":2") && r.text.contains("v9"), "{}", r.text);
     }
     #[test] fn binary_failure_changes_nothing_remote() {
         let (home, cfg, _) = setup("nobin");
