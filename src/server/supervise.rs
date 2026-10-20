@@ -17,10 +17,16 @@ const STOP_WAIT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(100);
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
-pub struct ExitRecord { pub time: String, pub code: Option<i32>, pub signal: Option<i32> }
+pub struct ExitRecord {
+    pub time: String,
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
 
 pub fn exit_record(status: ExitStatus, time: String) -> ExitRecord {
-    ExitRecord { time, code: status.code(), signal: status.signal() }
+    ExitRecord { time, code: status.code(), signal: status.signal(), note: None }
 }
 
 /// RFC 3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`) for seconds since the Unix epoch.
@@ -39,7 +45,7 @@ fn rfc3339(secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
-fn now_rfc3339() -> String {
+pub fn now_rfc3339() -> String {
     rfc3339(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))
 }
 
@@ -47,13 +53,12 @@ struct Paths { dir: PathBuf }
 impl Paths {
     fn new(home: &Home, name: &InstanceName) -> Paths { Paths { dir: home.instance(name) } }
     fn server_pid(&self) -> PathBuf { self.dir.join("server.pid") }
-    fn supervisor_pid(&self) -> PathBuf { self.dir.join("supervisor.pid") }
     fn last_exit(&self) -> PathBuf { self.dir.join("last_exit.json") }
     fn run_log(&self) -> PathBuf { self.dir.join("run.log") }
     fn config(&self) -> PathBuf { self.dir.join("instance.toml") }
 }
 
-fn read_pid(path: &Path) -> Option<u32> {
+pub fn read_pid(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path).ok().and_then(|t| t.trim().parse().ok())
 }
 
@@ -71,28 +76,36 @@ pub fn supervise(home: &Home, name: &InstanceName) -> io::Result<()> {
     let cfg = InstanceConfig::load(&p.config())?;
     let prefix = home.build_prefix(&cfg.build_key);
     let log = open_log(&p)?;
-    let _ = std::fs::remove_file(p.last_exit());
-    std::fs::write(p.supervisor_pid(), std::process::id().to_string())?;
-    let spawned = Command::new(prefix.join("bin/memcached")).args(server_args(&cfg, &prefix))
-        .current_dir(&p.dir).stdin(Stdio::null())
-        .stdout(log.try_clone()?).stderr(log).spawn();
+    let mut cmd = Command::new(prefix.join("bin/memcached"));
+    cmd.args(server_args(&cfg, &prefix)).current_dir(&p.dir);
+    run_supervised(&p.dir, cmd, log)
+}
+
+/// Runs `cmd` as the child of this supervisor process: `<dir>/supervisor.pid` and `server.pid` while it runs,
+/// `last_exit.json` once it has exited (the alert hook point). Shared by cache servers and ZooKeeper nodes.
+pub fn run_supervised(dir: &Path, mut cmd: Command, log: std::fs::File) -> io::Result<()> {
+    let (server_pid, supervisor_pid, last_exit) = (dir.join("server.pid"), dir.join("supervisor.pid"), dir.join("last_exit.json"));
+    let _ = std::fs::remove_file(&last_exit);
+    std::fs::write(&supervisor_pid, std::process::id().to_string())?;
+    let spawned = cmd.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log).spawn();
     let mut child = match spawned {
         Ok(c) => c,
-        Err(e) => { let _ = std::fs::remove_file(p.supervisor_pid()); return Err(e); }
+        Err(e) => { let _ = std::fs::remove_file(&supervisor_pid); return Err(e); }
     };
-    let _ = std::fs::write(p.server_pid(), child.id().to_string());
+    let _ = std::fs::write(&server_pid, child.id().to_string());
     let waited = child.wait();
     // Alert hook point: the server has exited; `rec` says how.
-    let result = waited.and_then(|st| {
-        let rec = exit_record(st, now_rfc3339());
-        std::fs::write(p.last_exit(), serde_json::to_vec_pretty(&rec).map_err(io::Error::other)?)
-    });
-    let _ = std::fs::remove_file(p.server_pid());
-    let _ = std::fs::remove_file(p.supervisor_pid());
+    let result = waited.and_then(|st| write_exit_record(&last_exit, &exit_record(st, now_rfc3339())));
+    let _ = std::fs::remove_file(&server_pid);
+    let _ = std::fs::remove_file(&supervisor_pid);
     result
 }
 
-fn comm_of(pid: u32) -> Option<String> {
+pub fn write_exit_record(path: &Path, rec: &ExitRecord) -> io::Result<()> {
+    std::fs::write(path, serde_json::to_vec_pretty(rec).map_err(io::Error::other)?)
+}
+
+pub fn comm_of(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     { std::fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|s| s.trim().to_string()) }
     #[cfg(not(target_os = "linux"))]
@@ -188,7 +201,8 @@ fn start_failure(port: u16, died: bool, pid: Option<u32>) -> String {
     }
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StopOutcome { Stopped, StillRunning, Killed, NotRunning }
 
 fn signal(pid: u32, sig: libc::c_int) {
@@ -219,7 +233,7 @@ pub fn stop(home: &Home, name: &InstanceName, force: bool) -> io::Result<StopOut
     else { Err(io::Error::other(format!("pid {pid} survived SIGKILL"))) }
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Status {
     pub name: String,
     pub running: bool,
@@ -269,7 +283,7 @@ mod tests {
 
     #[test]
     fn exit_by_signal() {
-        assert_eq!(exit_record(ExitStatus::from_raw(9), "t".into()), ExitRecord { time: "t".into(), code: None, signal: Some(9) });
+        assert_eq!(exit_record(ExitStatus::from_raw(9), "t".into()), ExitRecord { time: "t".into(), code: None, signal: Some(9), note: None });
     }
 
     #[test]

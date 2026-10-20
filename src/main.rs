@@ -19,7 +19,7 @@ pub const TAG: &str = match option_env!("ARCUS_CLI_TAG") { Some(t) => t, None =>
 
 #[derive(Parser, Debug)]
 #[command(version = env!("ARCUS_CLI_VERSION"), about, long_about = None)]
-#[command(group(ArgGroup::new("mode").multiple(true).args(["mcp", "job", "supervise", "call"])))]
+#[command(group(ArgGroup::new("mode").multiple(true).args(["mcp", "job", "supervise", "supervise_zk", "call", "agent", "agent_status"])))]
 struct Args {
     /// Host name or IP or Unix path
     #[arg(long, default_value_t = String::from("127.0.0.1"))]
@@ -74,6 +74,18 @@ struct Args {
     #[arg(long, hide = true, value_name = "NAME")]
     supervise: Option<String>,
 
+    /// Supervise a local ZooKeeper node (internal)
+    #[arg(long, hide = true, value_name = "ID")]
+    supervise_zk: Option<u32>,
+
+    /// Run the resident agent of this machine (internal; socket <home>/agent.sock)
+    #[arg(long, hide = true, action=ArgAction::SetTrue)]
+    agent: bool,
+
+    /// Print the running agent's info as one JSON line; exit 1 if no agent answers (internal)
+    #[arg(long, hide = true, action=ArgAction::SetTrue)]
+    agent_status: bool,
+
     /// Answer an ssh password prompt with a GUI dialog (internal; ssh's askpass protocol)
     #[arg(long, hide = true, value_name = "PROMPT")]
     askpass: Option<String>,
@@ -90,7 +102,8 @@ fn main() -> rustyline::Result<()> {
         std::process::exit(remote::ssh::askpass_main(prompt));
     }
 
-    if args.mcp || args.job.is_some() || args.call.is_some() || args.supervise.is_some() {
+    if args.mcp || args.job.is_some() || args.call.is_some() || args.supervise.is_some() || args.supervise_zk.is_some()
+        || args.agent || args.agent_status {
         let home = match server::home::Home::new(args.home.clone()) {
             Ok(h) => h,
             Err(e) => { eprintln!("ERROR: cannot prepare home directory: {e}"); std::process::exit(1); }
@@ -128,6 +141,20 @@ fn main() -> rustyline::Result<()> {
                 std::process::exit(1);
             }
             std::process::exit(0);
+        } else if let Some(id) = args.supervise_zk {
+            if let Err(e) = server::zookeeper::supervise_zk(&home, id) {
+                eprintln!("ERROR: {e}");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        } else if args.agent_status {
+            match server::agent::agent_request(&home, &serde_json::json!({"op": "info"})) {
+                Ok(mut info) => { info["running"] = serde_json::Value::Bool(true); println!("{info}"); }
+                Err(_) => std::process::exit(1),
+            }
+        } else if args.agent && let Err(e) = server::agent::run_agent(&home) {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
         }
         return Ok(());
     }
@@ -223,5 +250,12 @@ mod tests {
         assert!(Args::try_parse_from(["arcus-cli", "--home", "/x"]).is_err());
         assert!(Args::try_parse_from(["arcus-cli", "--job", "j1", "--home", "/x"]).is_ok());
         assert!(Args::try_parse_from(["arcus-cli", "--supervise", "n", "--home", "/x"]).is_ok());
+    }
+    #[test] fn agent_flags_parse() {
+        let a = Args::try_parse_from(["arcus-cli", "--agent", "--home", "/x"]).unwrap();
+        assert!(a.agent && !a.agent_status);
+        assert!(Args::try_parse_from(["arcus-cli", "--agent-status", "--home", "/x"]).unwrap().agent_status);
+        assert_eq!(Args::try_parse_from(["arcus-cli", "--supervise-zk", "2", "--home", "/x"]).unwrap().supervise_zk, Some(2));
+        assert!(Args::try_parse_from(["arcus-cli", "--supervise-zk", "x"]).is_err());
     }
 }
