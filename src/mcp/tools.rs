@@ -396,7 +396,7 @@ fn plaintext_consent_needed(os: &str, keyring: bool, remote: bool, accepted: boo
 
 /// Whether `org.freedesktop.secrets` has an owner on the session bus.
 fn secret_service_available() -> bool {
-    if !std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty()) { return false; }
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none_or(|v| v.is_empty()) { return false; }
     let run = |cmd: &str, args: &[&str]| std::process::Command::new(cmd).args(args)
         .stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok();
     if let Some(o) = run("dbus-send", &["--session", "--print-reply", "--dest=org.freedesktop.DBus", "/org/freedesktop/DBus",

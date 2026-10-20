@@ -319,7 +319,12 @@ fn reap_loop(agent: &Agent) {
 
 // ---------------------------------------------------------------- thread C: watching orphans of init/launchd
 
+#[derive(Debug, PartialEq)]
 enum Added { Watching, Gone }
+
+/// Only ESRCH means the pid already exited; any other watch error must fall back to polling (never record an exit).
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn add_error_means_gone(errno: Option<i32>) -> bool { errno == Some(libc::ESRCH) }
 
 #[cfg(target_os = "linux")]
 mod watcher {
@@ -339,7 +344,7 @@ mod watcher {
                 self.fds.push((pid, unsafe { OwnedFd::from_raw_fd(fd as i32) }));
                 return Added::Watching;
             }
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) { return Added::Gone; }
+            if super::add_error_means_gone(std::io::Error::last_os_error().raw_os_error()) { return Added::Gone; }
             self.polled.push(pid); // kernel without pidfd: poll for the pid instead
             Added::Watching
         }
@@ -366,21 +371,24 @@ mod watcher {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::time::Duration;
 
-    pub struct Watcher { kq: OwnedFd }
+    pub struct Watcher { kq: OwnedFd, polled: Vec<u32> }
     impl Watcher {
         pub fn new() -> std::io::Result<Watcher> {
             // SAFETY: kqueue(2) takes no arguments; returns a new fd or -1.
             let fd = unsafe { libc::kqueue() };
             if fd < 0 { return Err(std::io::Error::last_os_error()); }
             // SAFETY: fd is a freshly opened descriptor we own.
-            Ok(Watcher { kq: unsafe { OwnedFd::from_raw_fd(fd) } })
+            Ok(Watcher { kq: unsafe { OwnedFd::from_raw_fd(fd) }, polled: Vec::new() })
         }
         pub fn add(&mut self, pid: u32) -> Added {
             let ev = libc::kevent { ident: pid as libc::uintptr_t, filter: libc::EVFILT_PROC, flags: libc::EV_ADD | libc::EV_ONESHOT,
                 fflags: libc::NOTE_EXIT, data: 0, udata: std::ptr::null_mut() };
             // SAFETY: one valid changelist entry, no eventlist.
             let r = unsafe { libc::kevent(self.kq.as_raw_fd(), &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
-            if r < 0 { Added::Gone } else { Added::Watching } // ESRCH: already exited
+            if r >= 0 { return Added::Watching; }
+            if super::add_error_means_gone(std::io::Error::last_os_error().raw_os_error()) { return Added::Gone; }
+            self.polled.push(pid); // any other kevent error: poll for the pid instead
+            Added::Watching
         }
         pub fn wait(&mut self, timeout: Duration) -> Vec<u32> {
             // SAFETY: kevent is plain data; zeroed is a valid value.
@@ -388,7 +396,9 @@ mod watcher {
             let ts = libc::timespec { tv_sec: timeout.as_secs() as libc::time_t, tv_nsec: timeout.subsec_nanos() as libc::c_long };
             // SAFETY: evs has room for 16 events; ts is valid for the call.
             let n = unsafe { libc::kevent(self.kq.as_raw_fd(), std::ptr::null(), 0, evs.as_mut_ptr(), 16, &ts) };
-            evs[..n.max(0) as usize].iter().filter(|e| e.filter == libc::EVFILT_PROC).map(|e| e.ident as u32).collect()
+            let mut gone: Vec<u32> = evs[..n.max(0) as usize].iter().filter(|e| e.filter == libc::EVFILT_PROC).map(|e| e.ident as u32).collect();
+            self.polled.retain(|p| { let alive = super::pid_alive(*p); if !alive { gone.push(*p); } alive });
+            gone
         }
     }
 }
@@ -447,6 +457,14 @@ fn watch_loop(agent: &Agent) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn only_esrch_means_already_exited() {
+        assert!(add_error_means_gone(Some(libc::ESRCH)));
+        assert!(!add_error_means_gone(Some(libc::EACCES)));
+        assert!(!add_error_means_gone(Some(libc::ENOMEM)));
+        assert!(!add_error_means_gone(None));
+    }
     use std::time::{Duration, Instant};
 
     fn tmp_home(tag: &str) -> Home {
