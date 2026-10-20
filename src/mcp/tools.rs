@@ -29,6 +29,7 @@ pub fn registry() -> Vec<Box<dyn Tool>> {
         Box::new(Install),
         Box::new(ZkStart),
         Box::new(ZkStop),
+        Box::new(Setup),
     ]
 }
 
@@ -502,6 +503,264 @@ impl Tool for ZkStop {
         }
     }
 }
+
+/// Opens a znode store for an ensemble (a live ZooKeeper, or an in-memory store in tests).
+type Connect<'a> = &'a dyn Fn(&str) -> std::io::Result<std::rc::Rc<dyn crate::server::znode::ZnodeStore>>;
+type IpFor<'a> = &'a dyn Fn(&str) -> std::io::Result<std::net::IpAddr>;
+
+const SECRET_PLACEHOLDER: &str = "<SCRAM secret>";
+
+fn show_value(path: &str, v: &[u8]) -> String {
+    if path.ends_with("/authPassword") { SECRET_PLACEHOLDER.to_string() } else { String::from_utf8_lossy(v).into_owned() }
+}
+
+fn setup_with(home: &crate::server::home::Home, args: &Value, connect: Connect, ip_for: IpFor) -> ToolResult {
+    use crate::server::features::{build_key, validate};
+    use crate::server::home::InstanceName;
+    use crate::server::instance::{InstanceConfig, ReplConfig, SaslConfig, ZkTarget};
+    use crate::server::znode::{apply, diff, plan, verify, Action};
+    use std::collections::BTreeSet;
+
+    let name = match InstanceName::parse(&try_arg!(arg_str(args, "name"))) { Ok(n) => n, Err(e) => return ToolResult::err(e) };
+    let edition = match try_arg!(arg_str(args, "edition")).as_str() {
+        "public" => Edition::Public,
+        "ee" => Edition::Ee,
+        other => return ToolResult::err(format!("invalid edition '{other}': use \"public\" or \"ee\"")),
+    };
+    let version = try_arg!(arg_str(args, "version"));
+    let mut features = BTreeSet::new();
+    for v in args.get("features").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]) {
+        match serde_json::from_value::<Feature>(v.clone()) {
+            Ok(f) => { features.insert(f); }
+            Err(_) => return ToolResult::err(format!("unknown feature {v}; see arcus_list_features")),
+        }
+    }
+    if let Err(e) = validate(edition, &features) { return ToolResult::err(e); }
+    let port = match arg_u64(args, "port") {
+        None => 11211,
+        Some(p) if (1..=65535).contains(&p) => p as u16,
+        Some(p) => return ToolResult::err(format!("invalid port {p}")),
+    };
+    let memory_mb = match arg_u64(args, "memory_mb") {
+        None => 64,
+        Some(m) if (1..=u32::MAX as u64).contains(&m) => m as u32,
+        Some(m) => return ToolResult::err(format!("invalid memory_mb {m}")),
+    };
+    let do_apply = arg_bool(args, "apply", false);
+    let overwrite: Vec<String> = args.get("overwrite").and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+
+    /* Everything the user must decide is checked before anything is touched. */
+    let has_zk = features.contains(&Feature::Zk);
+    let (zk_target, service_code) = if has_zk {
+        let z = try_arg!(arg_str(args, "zk"));
+        let svc = try_arg!(arg_str(args, "service_code"));
+        let target = if z == "local" {
+            let zp = match arg_u64(args, "zk_port") {
+                None => 2181,
+                Some(p) if (1..=65535).contains(&p) => p,
+                Some(p) => return ToolResult::err(format!("invalid zk_port {p}")),
+            };
+            ZkTarget { ensemble: format!("127.0.0.1:{zp}"), local: true }
+        } else {
+            ZkTarget { ensemble: z, local: false }
+        };
+        (Some(target), Some(svc))
+    } else {
+        if arg_opt_str(args, "zk").is_some() { return ToolResult::err("`zk` needs the `zk` feature; add it to features or drop the argument"); }
+        (None, None)
+    };
+    let sasl = if features.contains(&Feature::Sasl) {
+        let group = try_arg!(arg_str(args, "acl_group"));
+        let user = arg_opt_str(args, "acl_user");
+        if user.is_some() && !zk_target.as_ref().is_some_and(|z| z.local) {
+            return ToolResult::err("acl_user can only be created on the local ZooKeeper (zk: \"local\"); an existing ensemble must already hold the user");
+        }
+        Some(SaslConfig { acl_group: group, user })
+    } else { None };
+    let repl_group = if features.contains(&Feature::Repl) { Some(try_arg!(arg_str(args, "repl_group"))) } else { None };
+
+    let key = build_key(edition, &version, &features);
+    let prefix = home.build_prefix(&key);
+    if !prefix.join("bin").join("memcached").is_file() {
+        return ToolResult::err(format!("No build {key} found at {}. Call arcus_install with the same edition, version and features first.", prefix.display()));
+    }
+
+    let (store, ip) = match &zk_target {
+        Some(z) => {
+            let store = match connect(&z.ensemble) {
+                Ok(s) => s,
+                Err(e) => return ToolResult::err(format!("Cannot reach ZooKeeper at {}: {e}{}", z.ensemble,
+                    if z.local { ". Call arcus_zk_start first." } else { "" })),
+            };
+            let ip = match ip_for(&z.ensemble) {
+                Ok(ip) => ip,
+                Err(e) => return ToolResult::err(format!("cannot determine this host's IP towards {}: {e}; set ARCUS_CACHE_PUBLIC_IP", z.ensemble)),
+            };
+            (Some(store), ip)
+        }
+        None => (None, std::net::IpAddr::from([127, 0, 0, 1])),
+    };
+    let repl = match repl_group {
+        Some(group) => {
+            let listen = match arg_opt_str(args, "repl_listen") {
+                Some(l) => l,
+                None => match port.checked_add(9000) {
+                    Some(rp) => format!("{ip}:{rp}"),
+                    None => return ToolResult::err("port + 9000 exceeds 65535; pass repl_listen"),
+                },
+            };
+            Some(ReplConfig { group, listen })
+        }
+        None => None,
+    };
+    let cfg = InstanceConfig {
+        name: name.as_str().to_string(), edition, version, features, build_key: key, port, memory_mb,
+        zk: zk_target, service_code, sasl, repl,
+    };
+
+    /* An existing ensemble must already define the ACL group; we never create it there. */
+    if let (Some(store), Some(z), Some(sc)) = (&store, &cfg.zk, &cfg.sasl) {
+        if !z.local {
+            let g = format!("/arcus_acl/{}", sc.acl_group);
+            match store.get(&g) {
+                Ok(Some(_)) => {}
+                Ok(None) => return ToolResult::err(format!("ACL group {g} does not exist on {}. Ask the user which ACL group to use (create it with arcusctl first).", z.ensemble)),
+                Err(e) => return ToolResult::err(format!("cannot read {g}: {e}")),
+            }
+        }
+    }
+
+    let inst_dir = home.instance(&name);
+    let pw_path = inst_dir.join("sasl_password");
+    let user_node = match (&cfg.zk, &cfg.sasl) {
+        (Some(z), Some(sc)) if z.local => sc.user.as_ref().map(|u| format!("/arcus_acl/{}/{u}", sc.acl_group)),
+        _ => None,
+    };
+    /* The secret in the plan: the stored one when this instance already owns a password file (so a rerun is a no-op),
+       a fresh SCRAM secret on apply, or a placeholder in a dry run. The plain password is never output. */
+    let mut fresh_password: Option<String> = None;
+    let secret: Option<String> = match (&user_node, &store) {
+        (Some(node), Some(store)) => {
+            let existing = match store.get(&format!("{node}/authPassword")) {
+                Ok(v) => v,
+                Err(e) => return ToolResult::err(format!("cannot read {node}/authPassword: {e}")),
+            };
+            match (pw_path.is_file(), existing) {
+                (true, Some(cur)) => Some(String::from_utf8_lossy(&cur).into_owned()),
+                (have_file, _) if do_apply => {
+                    let pw = if have_file {
+                        match std::fs::read_to_string(&pw_path) { Ok(p) => p, Err(e) => return ToolResult::err(format!("cannot read {}: {e}", pw_path.display())) }
+                    } else {
+                        let p = random_password();
+                        fresh_password = Some(p.clone());
+                        p
+                    };
+                    Some(crate::zk::scram_sha256(&pw))
+                }
+                _ => Some(SECRET_PLACEHOLDER.to_string()),
+            }
+        }
+        _ => None,
+    };
+
+    let diffs = match &store {
+        Some(store) => match diff(&**store, plan(&cfg, ip, secret.as_deref())) {
+            Ok(d) => d,
+            Err(e) => return ToolResult::err(format!("cannot read the current znodes: {e}")),
+        },
+        None => Vec::new(),
+    };
+    let plan_json: Vec<Value> = diffs.iter().map(|(z, a)| {
+        let mut e = json!({"path": z.path, "value": show_value(&z.path, &z.value)});
+        match a {
+            Action::Create => e["action"] = json!("create"),
+            Action::Same => e["action"] = json!("same"),
+            Action::Differs { current } => { e["action"] = json!("differs"); e["current"] = json!(show_value(&z.path, current)); }
+        }
+        e
+    }).collect();
+    let count = |act: &str| plan_json.iter().filter(|e| e["action"] == act).count();
+    let summary = format!("{} to create, {} differ (kept unless listed in overwrite), {} already as planned",
+        count("create"), count("differs"), count("same"));
+
+    if !do_apply {
+        let pw_note = user_node.as_ref().map(|_| format!(" The SASL password will be generated on apply and saved to {}.", pw_path.display())).unwrap_or_default();
+        return ToolResult::ok(
+            format!("Dry run, nothing was written: {summary}.{pw_note} Call arcus_setup again with apply=true to apply; list differing paths in overwrite to replace them.\n{}",
+                serde_json::to_string_pretty(&plan_json).unwrap_or_default()),
+            Some(json!({"applied": false, "plan": plan_json, "sasl_password_file": user_node.as_ref().map(|_| pw_path.display().to_string())})));
+    }
+
+    /* Save a freshly generated password only if its secret is actually going to be stored. */
+    if let (Some(pw), Some(node)) = (&fresh_password, &user_node) {
+        let auth = format!("{node}/authPassword");
+        let stored = diffs.iter().any(|(z, a)| z.path == auth
+            && (matches!(a, Action::Create) || (matches!(a, Action::Differs { .. }) && overwrite.contains(&auth))));
+        if stored {
+            if let Err(e) = write_secret(&pw_path, pw) { return ToolResult::err(format!("cannot save {}: {e}", pw_path.display())); }
+        }
+    }
+    let written = match &store {
+        Some(store) => match apply(&**store, &diffs, &overwrite) {
+            Ok(w) => w,
+            Err(e) => return ToolResult::err(format!("failed while writing znodes: {e}. Rerun arcus_setup with apply=true; existing znodes are kept.")),
+        },
+        None => Vec::new(),
+    };
+    let problems = store.as_ref().map(|s| verify(&**s, &cfg, ip)).unwrap_or_default();
+    let toml_path = inst_dir.join("instance.toml");
+    if let Err(e) = cfg.save(&toml_path) { return ToolResult::err(format!("znodes written but cannot save {}: {e}", toml_path.display())); }
+    let kept: Vec<&str> = diffs.iter().filter(|(z, a)| matches!(a, Action::Differs { .. }) && !overwrite.contains(&z.path)).map(|(z, _)| z.path.as_str()).collect();
+    let pw_file = (user_node.is_some() && pw_path.is_file()).then(|| pw_path.display().to_string());
+    let mut text = format!("Applied instance '{}': wrote {} znodes, saved {}.", cfg.name, written.len(), toml_path.display());
+    if !kept.is_empty() { text.push_str(&format!(" Kept differing znodes: {}.", kept.join(", "))); }
+    if let Some(f) = &pw_file { text.push_str(&format!(" The SASL password is in {f} (mode 600); do not print it.")); }
+    if !problems.is_empty() { text.push_str(&format!("\nProblems:\n- {}", problems.join("\n- "))); }
+    ToolResult::ok(text, Some(json!({
+        "applied": true, "written": written, "problems": problems, "kept_differing": kept,
+        "instance_toml": toml_path.display().to_string(), "sasl_password_file": pw_file, "plan": plan_json,
+    })))
+}
+
+struct Setup;
+impl Tool for Setup {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "arcus_setup",
+            description: "Define an ARCUS server instance and create the ZooKeeper znodes it needs to join a cluster. \
+                Needs an existing build (arcus_install) and a reachable ZooKeeper (arcus_zk_start for local). Without apply it \
+                only returns the plan (create/same/differs per znode) and writes nothing; call with apply=true after the user \
+                agrees. With a local ZooKeeper and acl_user it creates the SASL user with a generated password saved to \
+                instances/<name>/sasl_password (never shown). Ask the user for any missing name, service_code, acl_group or repl_group.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Instance name, [A-Za-z0-9_-]{1,64}"},
+                    "edition": {"type": "string", "enum": ["public", "ee"]},
+                    "version": {"type": "string", "description": "Version of the existing build"},
+                    "features": {"type": "array", "items": {"type": "string"}, "description": "Same features as the build"},
+                    "port": {"type": "integer", "description": "Cache port (default 11211)"},
+                    "memory_mb": {"type": "integer", "description": "Cache memory in MB (default 64)"},
+                    "zk": {"type": "string", "description": "\"local\" (127.0.0.1:2181 unless zk_port) or an ensemble address; required with the zk feature"},
+                    "zk_port": {"type": "integer", "description": "Port of the local ZooKeeper (default 2181)"},
+                    "service_code": {"type": "string", "description": "Service code (cloud name); required with zk"},
+                    "acl_group": {"type": "string", "description": "ACL group; required with sasl"},
+                    "acl_user": {"type": "string", "description": "SASL user to create (local ZooKeeper only)"},
+                    "repl_group": {"type": "string", "description": "Replication group; required with repl"},
+                    "repl_listen": {"type": "string", "description": "Replication listen ip:port (default <local ip>:<port+9000>)"},
+                    "apply": {"type": "boolean", "description": "Write the changes (default false: plan only)"},
+                    "overwrite": {"type": "array", "items": {"type": "string"}, "description": "Znode paths whose differing value may be replaced"}
+                },
+                "required": ["name", "edition", "version", "features"]
+            }),
+        }
+    }
+    fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
+        setup_with(&ctx.home, args, &|e| Ok(std::rc::Rc::new(crate::server::znode::ZkStore::connect(e)?)), &crate::server::instance::local_ip_for)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,5 +861,123 @@ mod tests {
         let t = registry().into_iter().find(|t| t.spec().name == "arcus_job_status").unwrap();
         assert!(t.call(&ctx(), &json!({"id": "install-1"})).is_error);
         assert!(t.call(&ctx(), &json!({})).is_error);
+    }
+
+    mod setup_tests {
+        use super::*;
+        use crate::server::znode::tests::MemStore;
+        use crate::server::znode::ZnodeStore;
+        use std::rc::Rc;
+
+        fn tmp_home(tag: &str) -> Home {
+            let root = std::env::temp_dir().join(format!("arcus-setup-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            Home::new(Some(root)).unwrap()
+        }
+        fn fake_build(h: &Home, key: &str) {
+            let bin = h.build_prefix(key).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join("memcached"), "").unwrap();
+        }
+        fn run(h: &Home, store: &Rc<MemStore>, args: Value) -> ToolResult {
+            let s = store.clone();
+            setup_with(h, &args, &move |_| Ok(s.clone() as Rc<dyn ZnodeStore>), &|_| Ok("10.0.0.1".parse().unwrap()))
+        }
+        fn args(extra: Value) -> Value {
+            let mut a = json!({"name": "dev", "edition": "ee", "version": "0.12.1", "features": ["zk"],
+                "zk": "10.0.0.1:2181", "service_code": "svc1"});
+            for (k, v) in extra.as_object().unwrap() { a[k] = v.clone(); }
+            a
+        }
+
+        #[test]
+        fn missing_names_ask_user() {
+            let h = tmp_home("missing");
+            let r = run(&h, &Rc::new(MemStore::default()), json!({"name": "dev", "edition": "ee", "version": "1", "features": ["zk"], "zk": "10.0.0.1:2181"}));
+            assert!(r.is_error && r.text.contains("service_code") && r.text.contains("ask the user"), "{}", r.text);
+        }
+
+        #[test]
+        fn requires_existing_build() {
+            let h = tmp_home("nobuild");
+            let r = run(&h, &Rc::new(MemStore::default()), args(json!({})));
+            assert!(r.is_error && r.text.contains("arcus_install"), "{}", r.text);
+        }
+
+        #[test]
+        fn no_apply_writes_nothing() {
+            let h = tmp_home("dry");
+            fake_build(&h, "ee-0.12.1-zk");
+            let st = Rc::new(MemStore::default());
+            let r = run(&h, &st, args(json!({})));
+            assert!(!r.is_error, "{}", r.text);
+            assert!(st.0.borrow().is_empty());
+            assert!(!h.root.join("instances").exists());
+            let plan = r.structured.unwrap()["plan"].as_array().unwrap().clone();
+            assert!(plan.iter().any(|e| e["path"] == "/arcus/cache_list/svc1" && e["action"] == "create"));
+        }
+
+        #[test]
+        fn apply_writes_and_saves() {
+            let h = tmp_home("apply");
+            fake_build(&h, "ee-0.12.1-zk");
+            let st = Rc::new(MemStore::default());
+            let r = run(&h, &st, args(json!({"apply": true})));
+            assert!(!r.is_error, "{}", r.text);
+            assert!(st.get("/arcus/cache_server_mapping/10.0.0.1:11211/svc1").unwrap().is_some());
+            assert!(h.root.join("instances/dev/instance.toml").is_file());
+            assert_eq!(r.structured.unwrap()["problems"].as_array().unwrap().len(), 0);
+        }
+
+        #[test]
+        fn local_sasl_user_password_stays_out_of_output() {
+            let h = tmp_home("sasl");
+            fake_build(&h, "ee-0.12.1-zk_sasl");
+            let st = Rc::new(MemStore::default());
+            let a = args(json!({"features": ["zk", "sasl"], "zk": "local", "acl_group": "grp", "acl_user": "dev"}));
+            let dry = run(&h, &st, a.clone());
+            assert!(!dry.is_error, "{}", dry.text);
+            assert!(!h.root.join("instances/dev/sasl_password").exists());
+            let mut ap = a.clone(); ap["apply"] = json!(true);
+            let r = run(&h, &st, ap.clone());
+            assert!(!r.is_error, "{}", r.text);
+            let pw_file = h.root.join("instances/dev/sasl_password");
+            let pw = std::fs::read_to_string(&pw_file).unwrap();
+            assert_eq!(pw.len(), 24);
+            let all = format!("{} {:?} {} {:?}", dry.text, dry.structured, r.text, r.structured);
+            assert!(!all.contains(&pw));
+            assert!(all.contains("<SCRAM secret>") && all.contains("sasl_password"));
+            let stored = String::from_utf8(st.get("/arcus_acl/grp/dev/authPassword").unwrap().unwrap()).unwrap();
+            assert!(stored.starts_with("SCRAM-SHA-256$"), "{stored}");
+            /* rerun: password reused and nothing differs */
+            let r2 = run(&h, &st, ap);
+            assert!(!r2.is_error, "{}", r2.text);
+            assert_eq!(std::fs::read_to_string(&pw_file).unwrap(), pw);
+            assert_eq!(st.get("/arcus_acl/grp/dev/authPassword").unwrap().unwrap(), stored.as_bytes());
+            assert!(r2.structured.unwrap()["written"].as_array().unwrap().is_empty());
+        }
+
+        #[test]
+        fn existing_ensemble_needs_existing_acl_group() {
+            let h = tmp_home("acl");
+            fake_build(&h, "ee-0.12.1-zk_sasl");
+            let st = Rc::new(MemStore::default());
+            let a = args(json!({"features": ["zk", "sasl"], "acl_group": "grp", "apply": true}));
+            let r = run(&h, &st, a.clone());
+            assert!(r.is_error && r.text.contains("/arcus_acl/grp"), "{}", r.text);
+            assert!(st.0.borrow().is_empty());
+            st.create("/arcus_acl", b"").unwrap();
+            st.create("/arcus_acl/grp", b"").unwrap();
+            assert!(!run(&h, &st, a).is_error);
+            assert_eq!(st.get("/arcus_acl_mapping/svc1").unwrap().unwrap(), b"grp");
+        }
+
+        #[test]
+        fn acl_user_rejected_for_existing_ensemble() {
+            let h = tmp_home("user");
+            fake_build(&h, "ee-0.12.1-zk_sasl");
+            let r = run(&h, &Rc::new(MemStore::default()), args(json!({"features": ["zk", "sasl"], "acl_group": "g", "acl_user": "u"})));
+            assert!(r.is_error && r.text.contains("acl_user"), "{}", r.text);
+        }
     }
 }
