@@ -10,6 +10,7 @@ const SUPPORTED: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 pub struct Ctx { pub home: Home }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolResult { pub text: String, pub structured: Option<Value>, pub is_error: bool }
 impl ToolResult {
     pub fn ok(text: impl Into<String>, structured: Option<Value>) -> ToolResult {
@@ -17,6 +18,17 @@ impl ToolResult {
     }
     pub fn err(text: impl Into<String>) -> ToolResult {
         ToolResult { text: text.into(), structured: None, is_error: true }
+    }
+    pub fn to_json(&self) -> Value {
+        json!({"text": self.text, "structured": self.structured, "is_error": self.is_error})
+    }
+    #[allow(dead_code)] // used by the remote client
+    pub fn from_json(v: &Value) -> Option<ToolResult> {
+        Some(ToolResult {
+            text: v.get("text")?.as_str()?.to_string(),
+            structured: v.get("structured").filter(|s| !s.is_null()).cloned(),
+            is_error: v.get("is_error")?.as_bool()?,
+        })
     }
 }
 
@@ -41,6 +53,33 @@ pub fn arg_bool(args: &Value, key: &str, default: bool) -> bool {
 fn reply(id: &Value, result: Value) -> Value { json!({"jsonrpc": "2.0", "id": id, "result": result}) }
 fn error(id: &Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+fn call_tool(tools: &[Box<dyn Tool>], ctx: &Ctx, name: &str, args: &Value) -> ToolResult {
+    match tools.iter().find(|t| t.spec().name == name) {
+        Some(t) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| t.call(ctx, args)))
+            .unwrap_or_else(|_| ToolResult::err(format!("tool `{name}` panicked; the server is still running (see stderr)"))),
+        None => ToolResult::err(format!("unknown tool `{name}`")),
+    }
+}
+
+/// Run one tool for `--call`: read a JSON object of arguments, write exactly one result line.
+pub fn run_call(tool: &str, mut input: impl io::Read, mut output: impl Write, tools: Vec<Box<dyn Tool>>, ctx: Ctx) -> io::Result<bool> {
+    let mut buf = String::new();
+    let res = match input.read_to_string(&mut buf) {
+        Err(e) => ToolResult::err(format!("cannot read arguments: {e}")),
+        Ok(_) => {
+            let parsed = if buf.trim().is_empty() { Ok(json!({})) } else { serde_json::from_str::<Value>(&buf) };
+            match parsed {
+                Ok(a) if a.is_object() => call_tool(&tools, &ctx, tool, &a),
+                Ok(_) => ToolResult::err("arguments must be a JSON object"),
+                Err(e) => ToolResult::err(format!("invalid arguments JSON: {e}")),
+            }
+        }
+    };
+    writeln!(output, "{}", json!({"arcus_call": 1, "tag": crate::TAG, "result": res.to_json()}))?;
+    output.flush()?;
+    Ok(!res.is_error)
 }
 
 fn handle(msg: &Value, tools: &[Box<dyn Tool>], ctx: &Ctx) -> Option<Value> {
@@ -69,11 +108,7 @@ fn handle(msg: &Value, tools: &[Box<dyn Tool>], ctx: &Ctx) -> Option<Value> {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let empty = json!({});
             let args = params.get("arguments").filter(|a| a.is_object()).unwrap_or(&empty);
-            let res = match tools.iter().find(|t| t.spec().name == name) {
-                Some(t) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| t.call(ctx, args)))
-                    .unwrap_or_else(|_| ToolResult::err(format!("tool `{name}` panicked; the server is still running (see stderr)"))),
-                None => ToolResult::err(format!("unknown tool `{name}`")),
-            };
+            let res = call_tool(tools, ctx, name, args);
             let mut out = json!({"content": [{"type": "text", "text": res.text}], "isError": res.is_error});
             if let Some(s) = res.structured { out["structuredContent"] = s; }
             reply(id, out)
@@ -189,5 +224,41 @@ mod tests {
         assert_eq!(h.build_prefix("k"), dir.join("builds/k"));
         assert_eq!(h.instance(&InstanceName::parse("a").unwrap()), dir.join("instances/a"));
         assert_eq!(h.jobs(), dir.join("jobs"));
+    }
+
+    fn call_out(tool: &str, input: &str) -> (bool, String) {
+        let dir = std::env::temp_dir().join(format!("arcus-cli-call-test-{}", std::process::id()));
+        let ctx = Ctx { home: crate::server::home::Home::new(Some(dir)).unwrap() };
+        let mut out = Vec::new();
+        let ok = run_call(tool, Cursor::new(input.to_string()), &mut out, vec![Box::new(Echo), Box::new(Boom)], ctx).unwrap();
+        (ok, String::from_utf8(out).unwrap())
+    }
+    #[test] fn tool_result_roundtrip() {
+        let r = ToolResult { text: "t".into(), structured: Some(json!({"a":1})), is_error: true };
+        assert_eq!(ToolResult::from_json(&r.to_json()).unwrap(), r);
+    }
+    #[test] fn call_runs_tool_and_prints_one_line() {
+        let (ok, out) = call_out("echo", r#"{"text":"hi"}"#);
+        assert!(ok);
+        assert_eq!(out.lines().count(), 1);
+        let v: Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["arcus_call"], 1);
+        assert_eq!(v["result"]["text"], "hi");
+        assert!(!v["tag"].as_str().unwrap().is_empty());
+    }
+    #[test] fn call_unknown_tool_is_error() {
+        let (ok, out) = call_out("nope", "{}");
+        assert!(!ok);
+        assert_eq!(out.lines().count(), 1);
+        let v: Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["result"]["is_error"], true);
+    }
+    #[test] fn call_catches_panic_and_bad_input() {
+        let (ok, out) = call_out("boom", "");
+        assert!(!ok);
+        assert_eq!(out.lines().count(), 1);
+        let (ok, out) = call_out("echo", "not json");
+        assert!(!ok);
+        assert_eq!(out.lines().count(), 1);
     }
 }
