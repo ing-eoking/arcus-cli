@@ -3,7 +3,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
-use crate::server::home::{Home, InstanceName};
+use crate::server::home::Home;
 
 const MAX_INCLUDE_DEPTH: usize = 8;
 
@@ -124,7 +124,16 @@ pub fn load_machines(home: &Home) -> io::Result<Vec<Machine>> {
 }
 
 pub fn save_machine(home: &Home, m: &Machine) -> io::Result<()> {
-    InstanceName::parse(&m.name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let bad = |e: String| io::Error::new(io::ErrorKind::InvalidInput, e);
+    if !valid_machine_name(&m.name) { return Err(bad(machine_name_error(&m.name))); }
+    if let Target::Explicit { host, user, identity_file, .. } = &m.target {
+        let opt = [("host", Some(host)), ("user", Some(user)), ("identity_file", identity_file.as_ref())];
+        for (field, v) in opt {
+            if v.is_some_and(|v| v.starts_with('-')) {
+                return Err(bad(format!("invalid {field}: must not start with '-'")));
+            }
+        }
+    }
     let mut all = load_machines(home)?;
     match all.iter_mut().find(|x| x.name == m.name) {
         Some(x) => *x = m.clone(),
@@ -138,9 +147,19 @@ pub fn save_machine(home: &Home, m: &Machine) -> io::Result<()> {
     std::fs::rename(&tmp, &path)
 }
 
+/// Machine names: 1..=255 chars, no whitespace/control chars, no '/', not starting with '-'.
+pub fn valid_machine_name(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 255 && !s.starts_with('-')
+        && !s.chars().any(|c| c.is_whitespace() || c.is_control() || c == '/')
+}
+
+fn machine_name_error(s: &str) -> String {
+    format!("invalid machine name `{s}`: use 1-255 characters, no whitespace, control characters or '/', not starting with '-'")
+}
+
 /// Registered machine first, then an ssh config alias.
 pub fn resolve(home: &Home, name: &str, ssh_config: &Path) -> Result<Machine, String> {
-    InstanceName::parse(name).map_err(|e| e.replace("instance name", "machine name"))?;
+    if !valid_machine_name(name) { return Err(machine_name_error(name)); }
     let registered = load_machines(home).map_err(|e| e.to_string())?;
     if let Some(m) = registered.into_iter().find(|m| m.name == name) { return Ok(m); }
     if ssh_config_aliases(ssh_config).unwrap_or_default().iter().any(|a| a == name) {
@@ -203,6 +222,30 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[1], mk(2222));
         assert!(save_machine(&home, &Machine { name: "a/b".into(), target: Target::SshAlias }).is_err());
+    }
+
+    #[test]
+    fn dotted_alias_resolves_and_bad_names_rejected() {
+        let d = tmp("dots");
+        let main = d.join("config");
+        std::fs::write(&main, "Host prod.example.com\n").unwrap();
+        let home = Home::new(Some(d.join("home"))).unwrap();
+        assert_eq!(resolve(&home, "prod.example.com", &main).unwrap().target, Target::SshAlias);
+        for n in ["-oProxyCommand=x", "a b", "a/b", ""] {
+            assert!(resolve(&home, n, &main).is_err(), "{n:?}");
+            assert!(!valid_machine_name(n));
+        }
+    }
+
+    #[test]
+    fn save_rejects_option_like_values() {
+        let home = Home::new(Some(tmp("optinj"))).unwrap();
+        let mk = |h: &str, u: &str, i: Option<&str>| Machine { name: "m".into(), target: Target::Explicit {
+            host: h.into(), user: u.into(), port: 22, identity_file: i.map(String::from) } };
+        assert!(save_machine(&home, &mk("-oX", "u", None)).is_err());
+        assert!(save_machine(&home, &mk("h", "-oX", None)).is_err());
+        assert!(save_machine(&home, &mk("h", "u", Some("-oX"))).is_err());
+        assert!(save_machine(&home, &mk("h", "u", Some("/k"))).is_ok());
     }
 
     #[test]
