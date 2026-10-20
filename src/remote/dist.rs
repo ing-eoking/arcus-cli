@@ -39,16 +39,36 @@ pub fn fetch_binary(home: &Home, tag: &str, target: &str) -> io::Result<PathBuf>
         let _ = std::fs::remove_file(&sha_path);
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid checksum file {sha_name}")));
     };
-    let tar_path = fetch_cached(&url(&tarball), &dir.join(&tarball), Some(&Checksum::Sha256(sha)))?;
+    let tar_path = match fetch_cached(&url(&tarball), &dir.join(&tarball), Some(&Checksum::Sha256(sha))) {
+        Ok(p) => p,
+        Err(e) => {
+            // A wrong checksum file must not be reused forever.
+            if e.kind() == io::ErrorKind::InvalidData { let _ = std::fs::remove_file(&sha_path); }
+            return Err(e);
+        }
+    };
     let top = extract(&tar_path, &dir.join("extract"))?;
-    std::fs::copy(top.join("arcus-cli"), &bin)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))?;
-    }
+    install_executable(&top.join("arcus-cli"), &bin)?;
     let _ = std::fs::remove_dir_all(dir.join("extract"));
     Ok(bin)
+}
+
+/// Copies `src` to `dest` with mode 755 via `dest.part` + rename, so `dest` never exists half-written.
+fn install_executable(src: &Path, dest: &Path) -> io::Result<()> {
+    let mut part_name = dest.as_os_str().to_owned();
+    part_name.push(".part");
+    let part = PathBuf::from(part_name);
+    let result = (|| {
+        std::fs::copy(src, &part)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755))?;
+        }
+        std::fs::rename(&part, dest)
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&part); }
+    result
 }
 
 const NO_TAG_HINT: &str = "this arcus-cli build has no release tag; pass `binary` (a locally built Linux arcus-cli binary) or `tag` (a release tag such as v1.2.0)";
@@ -115,5 +135,33 @@ mod tests {
         let home = Home::new(Some(root.clone())).unwrap();
         assert!(fetch_binary(&home, "../x", "t").is_err());
         let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn prepopulated_cache_is_returned_without_network() {
+        let root = std::env::temp_dir().join(format!("arcus-dist-cache-{}", std::process::id()));
+        let home = Home::new(Some(root.clone())).unwrap();
+        let d = home.dist_dir().join("v9.9.9").join("x86_64-unknown-linux-gnu");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("arcus-cli"), "bin").unwrap();
+        assert_eq!(fetch_binary(&home, "v9.9.9", "x86_64-unknown-linux-gnu").unwrap(), d.join("arcus-cli"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn install_executable_is_atomic_and_755() {
+        let d = std::env::temp_dir().join(format!("arcus-dist-inst-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let (src, dest) = (d.join("src"), d.join("arcus-cli"));
+        std::fs::write(&src, "bin").unwrap();
+        install_executable(&src, &dest).unwrap();
+        assert!(!d.join("arcus-cli.part").exists());
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "bin");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777, 0o755);
+        }
+        assert!(install_executable(&d.join("missing"), &d.join("o")).is_err());
+        assert!(!d.join("o.part").exists());
+        let _ = std::fs::remove_dir_all(d);
     }
 }
