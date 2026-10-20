@@ -28,17 +28,37 @@ pub fn parse_sha512_file(text: &str) -> Option<String> {
     (t.len() == 128 && t.chars().all(|c| c.is_ascii_hexdigit())).then(|| t.to_ascii_lowercase())
 }
 
-/// One member of the local ensemble (every port is on 127.0.0.1).
+/// One member of an ensemble. Without `address` every port is on 127.0.0.1; with it, other nodes (and clients)
+/// reach the node at `address` (an ensemble spread over several machines).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Node { pub id: u32, pub client_port: u16, pub peer_port: u16, pub election_port: u16 }
+pub struct Node {
+    pub id: u32, pub client_port: u16, pub peer_port: u16, pub election_port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+}
+
+impl Node {
+    pub fn host(&self) -> &str { self.address.as_deref().unwrap_or("127.0.0.1") }
+}
 
 /// Description of the local ensemble, stored as `zk/ensemble.json` while it runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Ensemble { pub version: String, pub nodes: Vec<Node> }
+pub struct Ensemble {
+    pub version: String,
+    /// All members of the ensemble (some may run on other machines).
+    pub nodes: Vec<Node>,
+    /// Ids of the members that run on this machine; empty means all of `nodes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_ids: Vec<u32>,
+}
 
 impl Ensemble {
     pub fn connect_string(&self) -> String {
-        self.nodes.iter().map(|n| format!("127.0.0.1:{}", n.client_port)).collect::<Vec<_>>().join(",")
+        self.nodes.iter().map(|n| format!("{}:{}", n.host(), n.client_port)).collect::<Vec<_>>().join(",")
+    }
+    /// The members that run on this machine.
+    pub fn local_nodes(&self) -> Vec<&Node> {
+        self.nodes.iter().filter(|n| self.local_ids.is_empty() || self.local_ids.contains(&n.id)).collect()
     }
 }
 
@@ -47,7 +67,8 @@ pub fn zoo_cfg(node: &Node, nodes: &[Node], data_dir: &Path) -> String {
     let mut c = format!("tickTime=2000\ninitLimit=10\nsyncLimit=5\ndataDir={}\nclientPort={}\nadmin.enableServer=false\n4lw.commands.whitelist=ruok,srvr\n",
         data_dir.display(), node.client_port);
     if nodes.len() > 1 {
-        for n in nodes { c.push_str(&format!("server.{}=127.0.0.1:{}:{}\n", n.id, n.peer_port, n.election_port)); }
+        for n in nodes { c.push_str(&format!("server.{}={}:{}:{}\n", n.id, n.host(), n.peer_port, n.election_port)); }
+        if nodes.iter().any(|n| n.address.is_some()) { c.push_str("quorumListenOnAllIPs=true\n"); }
     }
     c
 }
@@ -84,7 +105,7 @@ pub fn nodes_from_args(args: &Value) -> Result<Vec<Node>, String> {
     for p in client.iter().chain(&peer).chain(&election) {
         if !seen.insert(*p) { return Err(format!("port {p} is used more than once; all client, peer and election ports must be distinct")); }
     }
-    Ok((0..count).map(|i| Node { id: i as u32 + 1, client_port: client[i], peer_port: peer[i], election_port: election[i] }).collect())
+    Ok((0..count).map(|i| Node { id: i as u32 + 1, client_port: client[i], peer_port: peer[i], election_port: election[i], address: None }).collect())
 }
 
 /// Major Java version from `java -version` output (`1.8.0_x` -> 8).
@@ -241,6 +262,14 @@ fn four_letter(port: u16, word: &[u8]) -> Option<String> {
     Some(buf)
 }
 
+/// `Mode:` value of a `srvr` reply (`leader`, `follower`, `standalone`); `None` while the node is not serving.
+pub fn parse_mode(srvr: &str) -> Option<String> {
+    srvr.lines().find_map(|l| l.strip_prefix("Mode:")).map(|m| m.trim().to_string()).filter(|m| !m.is_empty())
+}
+
+/// Mode of the ZooKeeper node whose client port is `port` on this machine.
+pub fn mode(port: u16) -> Option<String> { four_letter(port, b"srvr").and_then(|b| parse_mode(&b)) }
+
 pub fn ruok(port: u16) -> bool { four_letter(port, b"ruok").is_some_and(|b| b.trim() == "imok") }
 
 /// True once the node serves requests. `ruok` already answers `imok` while a quorum is still forming,
@@ -279,14 +308,26 @@ fn wait_exit(pid: u32, secs: u64) {
     }
 }
 
-/// Starts the ensemble `nodes` (one detached java process per node), or returns the one already running
+/// Starts the ensemble `members` (one detached java process per node), or returns the one already running
 /// (`already_running`; the caller compares it with the request). Nodes started here are stopped again on failure.
-pub fn start(home: &Home, nodes: &[Node], version: &str) -> io::Result<Started> {
+/// `members` is the full member list of an ensemble that may span machines and `my_ids`
+/// (when given) selects the members started here. In that case readiness only waits for the local nodes to
+/// accept connections: the quorum needs the other machines.
+pub fn start_members(home: &Home, members: &[Node], my_ids: Option<&[u32]>, version: &str) -> io::Result<Started> {
+    let spanning = my_ids.is_some();
+    let local_ids: Vec<u32> = my_ids.map(<[u32]>::to_vec).unwrap_or_default();
+    let nodes_all = members;
+    let local: Vec<Node> = members.iter().filter(|n| !spanning || local_ids.contains(&n.id)).cloned().collect();
+    if local.is_empty() { return Err(io::Error::new(io::ErrorKind::InvalidInput, "no member of the ensemble runs on this machine (check my_ids)")); }
+    if let Some(bad) = local_ids.iter().find(|i| !members.iter().any(|n| n.id == **i)) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("my_ids contains {bad}, which is not a member id")));
+    }
+    let nodes: &[Node] = &local;
     if live_pid_in(&legacy_pid_file(home)).is_some() {
         return Err(io::Error::other("a ZooKeeper from an older arcus-cli layout is still running; call arcus_zk_stop first"));
     }
     if let Some(e) = read_ensemble(home) {
-        let pids: Vec<Option<u32>> = e.nodes.iter().map(|n| node_pid(home, n.id)).collect();
+        let pids: Vec<Option<u32>> = e.local_nodes().iter().map(|n| node_pid(home, n.id)).collect();
         if pids.iter().any(Option::is_some) { return Ok(Started { ensemble: e, pids, already_running: true }); }
     }
     if !valid_version(version) { return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid ZooKeeper version `{version}`"))); }
@@ -297,7 +338,7 @@ pub fn start(home: &Home, nodes: &[Node], version: &str) -> io::Result<Started> 
         return Err(io::Error::new(io::ErrorKind::NotFound, format!("ZooKeeper {version} is not downloaded")));
     }
     let java = find_java(home).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no Java 8+ found"))?;
-    let ensemble = Ensemble { version: version.to_string(), nodes: nodes.to_vec() };
+    let ensemble = Ensemble { version: version.to_string(), nodes: nodes_all.to_vec(), local_ids };
     let exe = std::env::current_exe()?;
     // (node id, its supervisor process)
     let mut children: Vec<(u32, std::process::Child)> = Vec::new();
@@ -306,9 +347,9 @@ pub fn start(home: &Home, nodes: &[Node], version: &str) -> io::Result<Started> 
             let dir = node_dir(home, n.id);
             let data = dir.join("data");
             std::fs::create_dir_all(&data)?;
-            if nodes.len() > 1 { std::fs::write(data.join("myid"), n.id.to_string())?; }
+            if nodes_all.len() > 1 { std::fs::write(data.join("myid"), n.id.to_string())?; }
             let cfg = dir.join("zoo.cfg");
-            std::fs::write(&cfg, zoo_cfg(n, nodes, &data))?;
+            std::fs::write(&cfg, zoo_cfg(n, nodes_all, &data))?;
             let launch = Launch { java: java.clone(), args: vec!["-cp".into(), format!("{}/lib/*", dist.display()),
                 "org.apache.zookeeper.server.quorum.QuorumPeerMain".into(), cfg.display().to_string()] };
             std::fs::write(launch_file(home, n.id), serde_json::to_vec_pretty(&launch).map_err(io::Error::other)?)?;
@@ -338,9 +379,10 @@ pub fn start(home: &Home, nodes: &[Node], version: &str) -> io::Result<Started> 
                         logp.display(), super::jobs::tail(&logp, 20).unwrap_or_default())));
                 }
             }
-            if nodes.iter().all(|n| serving(n.client_port)) { return Ok(()); }
+            let ready = |n: &Node| if spanning { ruok(n.client_port) } else { serving(n.client_port) };
+            if nodes.iter().all(ready) { return Ok(()); }
             if Instant::now() >= deadline {
-                let waiting: Vec<String> = nodes.iter().filter(|n| !serving(n.client_port)).map(|n| n.id.to_string()).collect();
+                let waiting: Vec<String> = nodes.iter().filter(|n| !ready(n)).map(|n| n.id.to_string()).collect();
                 return Err(io::Error::other(format!("ZooKeeper node(s) {} was not serving within 20 s; see {}/node<id>/zookeeper.log",
                     waiting.join(","), home.zk_dir().display())));
             }
@@ -374,7 +416,7 @@ pub fn start(home: &Home, nodes: &[Node], version: &str) -> io::Result<Started> 
 /// Pid files and `ensemble.json` are removed; data stays. Returns the number of processes stopped.
 pub fn stop(home: &Home) -> io::Result<usize> {
     let mut files: Vec<PathBuf> = read_ensemble(home)
-        .map(|e| e.nodes.iter().flat_map(|n| [pid_file(home, n.id), old_node_pid_file(home, n.id)]).collect()).unwrap_or_default();
+        .map(|e| e.local_nodes().into_iter().flat_map(|n| [pid_file(home, n.id), old_node_pid_file(home, n.id)]).collect()).unwrap_or_default();
     files.push(legacy_pid_file(home));
     let mut seen_any = ensemble_file(home).exists();
     let mut stopped = 0;
@@ -395,7 +437,7 @@ mod tests {
     use super::*;
 
     fn nodes3() -> Vec<Node> {
-        (1..=3).map(|i| Node { id: i, client_port: 22180 + i as u16, peer_port: 22887 + i as u16, election_port: 23887 + i as u16 }).collect()
+        (1..=3).map(|i| Node { id: i, client_port: 22180 + i as u16, peer_port: 22887 + i as u16, election_port: 23887 + i as u16, address: None }).collect()
     }
     #[test] fn cfg_three_nodes() {
         let n = nodes3();
@@ -405,6 +447,31 @@ mod tests {
             assert!(c.contains(want), "server.{} missing in {c}", i + 1);
         }
         for k in ["tickTime=2000\n", "initLimit=10\n", "syncLimit=5\n", "admin.enableServer=false\n", "4lw.commands.whitelist=ruok,srvr\n"] { assert!(c.contains(k), "{k}"); }
+    }
+    fn addr_nodes() -> Vec<Node> {
+        nodes3().into_iter().map(|mut n| { n.address = Some(format!("10.0.0.{}", n.id)); n.peer_port = 2888; n.election_port = 3888; n }).collect()
+    }
+    #[test] fn cfg_with_addresses() {
+        let n = addr_nodes();
+        let c = zoo_cfg(&n[0], &n, Path::new("/d"));
+        assert!(c.contains("server.2=10.0.0.2:2888:3888\n") && c.contains("server.3=10.0.0.3:2888:3888\n"), "{c}");
+        assert!(c.contains("quorumListenOnAllIPs=true\n"), "{c}");
+        assert!(!zoo_cfg(&nodes3()[0], &nodes3(), Path::new("/d")).contains("quorumListenOnAllIPs"));
+    }
+    #[test] fn connect_string_uses_member_addresses() {
+        let e = Ensemble { version: "3.8.6".into(), nodes: addr_nodes(), local_ids: vec![2] };
+        assert_eq!(e.connect_string(), "10.0.0.1:22181,10.0.0.2:22182,10.0.0.3:22183");
+        assert_eq!(e.local_nodes().len(), 1);
+        assert_eq!(e.local_nodes()[0].id, 2);
+    }
+    #[test] fn old_ensemble_json_still_reads() {
+        let e: Ensemble = serde_json::from_str(r#"{"version":"3.8.6","nodes":[{"id":1,"client_port":1,"peer_port":2,"election_port":3}]}"#).unwrap();
+        assert_eq!(e.local_nodes().len(), 1);
+        assert_eq!(e.connect_string(), "127.0.0.1:1");
+    }
+    #[test] fn mode_parsing() {
+        assert_eq!(parse_mode("Zookeeper version: x\nMode: follower\nNode count: 4\n").as_deref(), Some("follower"));
+        assert_eq!(parse_mode("This ZooKeeper instance is not currently serving requests"), None);
     }
     #[test] fn cfg_single_node_is_standalone() {
         let n = &nodes3()[..1];
@@ -436,7 +503,7 @@ mod tests {
         assert!(err(json!({"count": 1, "client_ports": ["x"]})).contains("client_ports"));
     }
     #[test] fn ensemble_string_and_file_roundtrip() {
-        let e = Ensemble { version: "3.8.6".into(), nodes: nodes3() };
+        let e = Ensemble { version: "3.8.6".into(), nodes: nodes3(), local_ids: vec![] };
         assert_eq!(e.connect_string(), "127.0.0.1:22181,127.0.0.1:22182,127.0.0.1:22183");
         let d = std::env::temp_dir().join(format!("arcus-zk-ens-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);

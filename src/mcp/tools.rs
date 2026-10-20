@@ -30,6 +30,7 @@ pub fn registry() -> Vec<Box<dyn Tool>> {
         Box::new(Remote(Install)),
         Box::new(Remote(ZkStart)),
         Box::new(Remote(ZkStop)),
+        Box::new(Remote(ZkMode)),
         Box::new(Remote(Setup)),
         Box::new(Remote(Start)),
         Box::new(Remote(Stop)),
@@ -505,6 +506,9 @@ impl Tool for ZkStart {
                     "base_client_port": {"type": "integer", "description": "First client port when client_ports is omitted (recommended 2181)"},
                     "base_peer_port": {"type": "integer", "description": "First peer port when peer_ports is omitted (recommended 2888)"},
                     "base_election_port": {"type": "integer", "description": "First election port when election_ports is omitted (recommended 3888)"},
+                    "members": {"type": "array", "description": "Ensemble spread over several machines: the full member list [{id, address, client_port, peer_port, election_port}] (normally set by arcus_cluster_zk_start, not by hand)",
+                        "items": {"type": "object"}},
+                    "my_ids": {"type": "array", "items": {"type": "integer"}, "description": "With members: ids of the members to run on this machine"},
                     "version": {"type": "string", "description": "ZooKeeper version (recommended 3.8.6)"},
                     "download_jre": {"type": "boolean", "description": "Download a Temurin 17 JRE if no Java is found (default false)"}
                 }
@@ -514,7 +518,11 @@ impl Tool for ZkStart {
     fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
         use crate::server::jobs::{self, JobKind, JobSpec};
         use crate::server::zookeeper as zk;
-        let nodes = match zk::nodes_from_args(args) { Ok(n) => n, Err(e) => return ToolResult::err(e) };
+        let (nodes, my_ids) = match zk_members_from_args(args) {
+            Ok(Some(m)) => (m.0, Some(m.1)),
+            Ok(None) => match zk::nodes_from_args(args) { Ok(n) => (n, None), Err(e) => return ToolResult::err(e) },
+            Err(e) => return ToolResult::err(e),
+        };
         let version = arg_opt_str(args, "version").unwrap_or_else(|| zk::DEFAULT_ZK_VERSION.to_string());
         if !zk::valid_version(&version) { return ToolResult::err(format!("invalid ZooKeeper version `{version}`")); }
         let want_jre = arg_bool(args, "download_jre", false);
@@ -536,13 +544,13 @@ impl Tool for ZkStart {
                 };
             }
         }
-        match crate::server::agent::zk_start(&ctx.home, &nodes, &version) {
+        match crate::server::agent::zk_start_members(&ctx.home, &nodes, my_ids.as_deref(), &version) {
             Ok(st) => {
                 let ensemble = st.ensemble.connect_string();
-                let list: Vec<Value> = st.ensemble.nodes.iter().zip(&st.pids).map(|(n, pid)| json!({
+                let list: Vec<Value> = st.ensemble.local_nodes().into_iter().zip(&st.pids).map(|(n, pid)| json!({
                     "id": n.id, "client_port": n.client_port, "peer_port": n.peer_port, "election_port": n.election_port,
                     "pid": pid, "running": pid.is_some()})).collect();
-                let note = if !st.already_running { String::new() } else if st.ensemble.nodes == nodes && st.ensemble.version == version {
+                let note = if !st.already_running { String::new() } else if st.ensemble.nodes == nodes && st.ensemble.version == version && st.ensemble.local_ids == my_ids.clone().unwrap_or_default() {
                     " It was already running.".to_string()
                 } else {
                     format!(" A local ensemble was already running with different settings (version {}), so nothing new was started; \
@@ -555,6 +563,40 @@ impl Tool for ZkStart {
             }
             Err(e) => ToolResult::err(format!("arcus_zk_start failed: {e}")),
         }
+    }
+}
+
+/// `members` + `my_ids` of `arcus_zk_start` (an ensemble spread over several machines).
+type ZkMembers = (Vec<crate::server::zookeeper::Node>, Vec<u32>);
+fn zk_members_from_args(args: &Value) -> Result<Option<ZkMembers>, String> {
+    let Some(m) = args.get("members").filter(|v| !v.is_null()) else { return Ok(None) };
+    let members: Vec<crate::server::zookeeper::Node> = serde_json::from_value(m.clone()).map_err(|e| format!("bad `members`: {e}"))?;
+    if members.is_empty() || members.len() > 7 { return Err("`members` must list 1 to 7 nodes".into()); }
+    let ids: Vec<u32> = serde_json::from_value(args.get("my_ids").cloned().unwrap_or(Value::Null))
+        .map_err(|_| "`my_ids` (array of node ids to run on this machine) is required with `members`".to_string())?;
+    if ids.is_empty() { return Err("`my_ids` must not be empty".into()); }
+    let mut seen = std::collections::BTreeSet::new();
+    for n in &members { if !seen.insert(n.id) { return Err(format!("duplicate member id {}", n.id)); } }
+    if let Some(b) = ids.iter().find(|i| !members.iter().any(|n| n.id == **i)) { return Err(format!("my_ids has {b}, which is not a member id")); }
+    if members.len() > 1 && members.iter().any(|n| n.address.is_none()) { return Err("every member needs an `address` when several machines are used".into()); }
+    Ok(Some((members, ids)))
+}
+
+struct ZkMode;
+impl Tool for ZkMode {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "arcus_zk_mode",
+            description: "Report the mode (leader, follower or standalone) of the ZooKeeper node listening on a client port of this computer; null when it is not serving.",
+            input_schema: json!({"type": "object", "properties": {"port": {"type": "integer", "description": "Client port (recommended 2181)"}}, "required": ["port"]}),
+        }
+    }
+    fn call(&self, _ctx: &Ctx, args: &Value) -> ToolResult {
+        let Some(port) = arg_u64(args, "port").and_then(|p| u16::try_from(p).ok()).filter(|p| *p != 0) else {
+            return ToolResult::err("missing or invalid argument `port` (1..=65535)");
+        };
+        let mode = crate::server::zookeeper::mode(port);
+        ToolResult::ok(format!("ZooKeeper on port {port}: {}", mode.as_deref().unwrap_or("not serving")), Some(json!({"mode": mode})))
     }
 }
 
@@ -1200,7 +1242,7 @@ mod tests {
             let h = tmp_home("sasl");
             fake_build(&h, "ee-0.12.1-zk_sasl");
             crate::server::zookeeper::write_ensemble(&h, &crate::server::zookeeper::Ensemble { version: "3.8.6".into(),
-                nodes: vec![crate::server::zookeeper::Node { id: 1, client_port: 22181, peer_port: 22888, election_port: 23888 }] }).unwrap();
+                nodes: vec![crate::server::zookeeper::Node { id: 1, client_port: 22181, peer_port: 22888, election_port: 23888, address: None }], local_ids: vec![] }).unwrap();
             let st = Rc::new(MemStore::default());
             let a = args(json!({"features": ["zk", "sasl"], "zk": "local", "acl_group": "grp", "acl_user": "dev"}));
             let dry = run(&h, &st, a.clone());
@@ -1238,8 +1280,8 @@ mod tests {
             };
             let r = go(&h);
             assert!(r.is_error && r.text.contains("arcus_zk_start"), "{}", r.text);
-            let nodes = (1..=3).map(|i| Node { id: i, client_port: 22180 + i as u16, peer_port: 22887 + i as u16, election_port: 23887 + i as u16 }).collect();
-            write_ensemble(&h, &Ensemble { version: "3.8.6".into(), nodes }).unwrap();
+            let nodes = (1..=3).map(|i| Node { id: i, client_port: 22180 + i as u16, peer_port: 22887 + i as u16, election_port: 23887 + i as u16, address: None }).collect();
+            write_ensemble(&h, &Ensemble { version: "3.8.6".into(), nodes, local_ids: vec![] }).unwrap();
             let r = go(&h);
             assert!(!r.is_error, "{}", r.text);
             assert_eq!(*seen.borrow(), "127.0.0.1:22181,127.0.0.1:22182,127.0.0.1:22183");
