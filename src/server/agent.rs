@@ -89,10 +89,15 @@ pub fn status(home: &Home, name: Option<&InstanceName>) -> io::Result<Vec<Status
     }
 }
 
-pub fn zk_start(home: &Home, nodes: &[Node], version: &str) -> io::Result<Started> {
-    match try_request(home, &json!({"op": "zk_start", "nodes": nodes, "version": version})) {
+/// Starts the ensemble `members` (may span machines); `my_ids` selects the members that run here.
+pub fn zk_start_members(home: &Home, members: &[Node], my_ids: Option<&[u32]>, version: &str) -> io::Result<Started> {
+    let req = match my_ids {
+        Some(ids) => json!({"op": "zk_start", "members": members, "my_ids": ids, "version": version}),
+        None => json!({"op": "zk_start", "nodes": members, "version": version}),
+    };
+    match try_request(home, &req) {
         Some(r) => decode(r?),
-        None => zookeeper::start(home, nodes, version),
+        None => zookeeper::start_members(home, members, my_ids, version),
     }
 }
 
@@ -195,11 +200,13 @@ fn handle(agent: &Agent, req: &Value) -> Result<Value, String> {
             supervise::stop(home, &name, req["force"].as_bool().unwrap_or(false)).map(|o| json!({"outcome": o})).map_err(es)
         }
         "zk_start" => {
-            if !req["members"].is_null() { return Err("`members` is not supported by this agent yet".into()); }
-            let nodes: Vec<Node> = serde_json::from_value(req["nodes"].clone()).map_err(|e| format!("bad `nodes`: {e}"))?;
+            let (key, my_ids): (&str, Option<Vec<u32>>) = if req["members"].is_null() { ("nodes", None) } else {
+                ("members", Some(serde_json::from_value(req["my_ids"].clone()).map_err(|e| format!("bad `my_ids`: {e}"))?))
+            };
+            let nodes: Vec<Node> = serde_json::from_value(req[key].clone()).map_err(|e| format!("bad `{key}`: {e}"))?;
             let version = str_arg(req, "version")?;
             let _g = lock();
-            let st = zookeeper::start(home, &nodes, &version).map_err(es)?;
+            let st = zookeeper::start_members(home, &nodes, my_ids.as_deref(), &version).map_err(es)?;
             serde_json::to_value(st).map_err(|e| e.to_string())
         }
         "zk_stop" => {
