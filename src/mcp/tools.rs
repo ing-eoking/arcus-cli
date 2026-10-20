@@ -2,7 +2,7 @@ use super::{arg_bool, arg_opt_str, arg_str, arg_u64, Ctx, Tool, ToolResult, Tool
 use crate::connect::collect_responses;
 use crate::server::build::{detect_os, install_hint, missing_tools, on_path};
 use crate::server::features::{Edition, Feature};
-use crate::server::release::{self, find_gh, find_token};
+use crate::server::release::{self, find_gh, find_tokens};
 use crate::server::secret::{random_password, write_secret};
 use crate::zk::{zk_exec, ZkCommand};
 use serde_json::{json, Value};
@@ -62,7 +62,7 @@ impl Tool for MemcachedCommand {
     }
     fn call(&self, _ctx: &Ctx, args: &Value) -> ToolResult {
         let command = try_arg!(arg_str(args, "command"));
-        let idle = Duration::from_millis(arg_u64(args, "idle_ms").unwrap_or(300));
+        let idle = idle_of(args);
         let (addr, unix) = match arg_opt_str(args, "unix_path") {
             Some(p) => (p, true),
             None => {
@@ -71,11 +71,16 @@ impl Tool for MemcachedCommand {
                 (format!("{host}:{port}"), false)
             }
         };
-        match collect_responses(&addr, unix, &command, idle, MAX_WAIT.max(idle), MAX_BYTES) {
+        match collect_responses(&addr, unix, &command, idle, MAX_WAIT, MAX_BYTES) {
             Ok(text) => ToolResult::ok(text, None),
             Err(e) => ToolResult::err(format!("memcached_command failed: {e}")),
         }
     }
+}
+
+/// Idle wait from `idle_ms`, never longer than the overall limit.
+fn idle_of(args: &Value) -> Duration {
+    Duration::from_millis(arg_u64(args, "idle_ms").unwrap_or(300)).min(MAX_WAIT)
 }
 
 /// Runs a ZooKeeper command; output lines starting with `ERROR: ` make the result an error.
@@ -92,7 +97,7 @@ fn zk_schema(extra: &[(&str, &str)], required: &[&str]) -> Value {
         "ensemble": {"type": "string", "description": "ZooKeeper address, e.g. 127.0.0.1:2181"},
         "path": {"type": "string", "description": "Znode path, e.g. /arcus"}
     });
-    for (k, d) in extra { props[*k] = json!({"type": if *k == "recursive" {"boolean"} else {"string"}, "description": d}); }
+    for (k, d) in extra { props[*k] = json!({"type": if *k == "recursive" || *k == "overwrite" {"boolean"} else {"string"}, "description": d}); }
     json!({"type": "object", "properties": props, "required": required})
 }
 
@@ -165,18 +170,42 @@ fn password_result(path: &str, file: &Path, _password: &str) -> ToolResult {
     )
 }
 
+fn auth_node(path: &str) -> String {
+    if path == "/" { "/authPassword".to_string() } else { format!("{path}/authPassword") }
+}
+
+/// Refuses (as a tool error) when `<path>/authPassword` already exists, so an existing password is never replaced unasked.
+fn password_guard(store: &dyn crate::server::znode::ZnodeStore, path: &str) -> Result<(), ToolResult> {
+    let node = auth_node(path);
+    match store.get(&node) {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => Err(ToolResult::err(format!(
+            "{node} already holds a password secret. Nothing was changed. Ask the user whether to replace it; \
+             if they agree, call zk_password again with overwrite=true."))),
+        Err(e) => Err(ToolResult::err(format!("cannot check {node}: {e}"))),
+    }
+}
+
 struct ZkPassword;
 impl Tool for ZkPassword {
     fn spec(&self) -> ToolSpec {
         ToolSpec { name: "zk_password",
-            description: "Generate a password, store its SCRAM-SHA-256 secret at <path>/authPassword, and save the plain password to a private file. Returns only the file path.",
-            input_schema: zk_schema(&[], &["ensemble", "path"]) }
+            description: "Generate a password, store its SCRAM-SHA-256 secret at <path>/authPassword, and save the plain password to a private file. Returns only the file path. \
+                If <path>/authPassword already exists the call is refused: ask the user whether to replace the existing password, and only then call again with overwrite=true.",
+            input_schema: zk_schema(&[("overwrite", "Replace an existing <path>/authPassword (default false); set only after the user agrees")], &["ensemble", "path"]) }
     }
     fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
         let ensemble = try_arg!(arg_str(args, "ensemble"));
         let path = try_arg!(arg_str(args, "path"));
         if !path.starts_with('/') { return ToolResult::err("path must be an absolute znode path starting with `/`"); }
         let path = if path.len() > 1 { path.trim_end_matches('/').to_string() } else { path };
+        let overwrite = arg_bool(args, "overwrite", false);
+        if !overwrite {
+            match crate::server::znode::ZkStore::connect(&ensemble) {
+                Ok(store) => if let Err(r) = password_guard(&store, &path) { return r; },
+                Err(e) => return ToolResult::err(e.to_string()),
+            }
+        }
         let password = random_password();
         let r = run_zk(&ensemble, ZkCommand::Password { path: path.clone(), password: password.clone() });
         if r.is_error { return r; }
@@ -273,6 +302,8 @@ impl Tool for JobStatusTool {
     }
 }
 
+const NO_LOGIN_HINT: &str = "EE access needs a GitHub login: call arcus_ee_login, show the code and URL to the user, then retry.";
+
 struct ListVersions;
 impl Tool for ListVersions {
     fn spec(&self) -> ToolSpec {
@@ -293,22 +324,22 @@ impl Tool for ListVersions {
             "ee" => Edition::Ee,
             other => return ToolResult::err(format!("invalid edition '{other}': use \"public\" or \"ee\"")),
         };
-        let login_hint = "EE access needs a GitHub login: call arcus_ee_login, show the code and URL to the user, then retry.";
-        let token = if edition == Edition::Ee {
-            match find_token(find_gh(&ctx.home).as_deref()) {
-                Some(t) => Some(t),
-                None => return ToolResult::err(format!("No GitHub token found. {login_hint}")),
+        let listed = if edition == Edition::Ee {
+            let tokens = find_tokens(find_gh(&ctx.home).as_deref());
+            if tokens.is_empty() {
+                return ToolResult::err(format!("No GitHub token found. {NO_LOGIN_HINT}"));
             }
-        } else { None };
-        match release::list_releases(edition, token.as_ref()) {
+            release::list_ee_releases(&tokens).map(|(l, _)| l)
+                .map_err(|e| release::ee_failure("arcus_list_versions failed", &e))
+        } else {
+            release::list_releases(edition, None).map_err(|e| format!("arcus_list_versions failed: {e}"))
+        };
+        match listed {
             Ok(list) => {
                 let versions: Vec<&str> = list.iter().map(|r| r.version.as_str()).collect();
                 ToolResult::ok(versions.join("\n"), Some(json!({"versions": versions})))
             }
-            Err(e) if edition == Edition::Ee && (e.kind() == std::io::ErrorKind::PermissionDenied
-                || e.kind() == std::io::ErrorKind::NotFound) =>
-                ToolResult::err(format!("GitHub denied access to the EE releases ({e}). {login_hint}")),
-            Err(e) => ToolResult::err(format!("arcus_list_versions failed: {e}")),
+            Err(msg) => ToolResult::err(msg),
         }
     }
 }
@@ -324,37 +355,47 @@ impl Tool for EeLogin {
         }
     }
     fn call(&self, ctx: &Ctx, _args: &Value) -> ToolResult {
-        use crate::server::jobs::{self, JobKind, JobSpec, JobState};
-        // Downloading gh happens synchronously, before the job is submitted.
-        if find_gh(&ctx.home).is_none()
-            && let Err(e) = release::download_gh(&ctx.home) {
-                return ToolResult::err(format!("GitHub CLI (gh) is not installed and downloading it failed: {e}"));
-            }
+        use crate::server::jobs::{self, JobKind, JobSpec};
+        // The job downloads gh itself when it is missing, so this call never blocks on that download.
         let id = match jobs::submit(&ctx.home, JobSpec { kind: JobKind::EeLogin, params: json!({}) }) {
             Ok(id) => id,
             Err(e) => return ToolResult::err(format!("failed to start the login job: {e}")),
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
-            if let Ok(s) = jobs::status(&ctx.home, &id) {
-                let code = s.result.as_ref().and_then(|r| r["code"].as_str()).map(str::to_string);
-                if let Some(code) = code {
-                    let url = s.result.as_ref().and_then(|r| r["url"].as_str()).unwrap_or(release::DEVICE_URL).to_string();
-                    return ToolResult::ok(
-                        format!("Show this to the user: open {url} and enter the one-time code {code}. \
-                            Then poll arcus_job_status with id {id} until it is succeeded."),
-                        Some(json!({"job_id": id, "code": code, "url": url})));
-                }
-                if s.state != JobState::Running {
-                    return ToolResult::err(format!("login job {id} {:?}: {}", s.state, s.message));
-                }
-            }
+            if let Ok(s) = jobs::status(&ctx.home, &id)
+                && let Some(r) = login_reply(&id, &s, false) { return r; }
             if std::time::Instant::now() >= deadline { break; }
             std::thread::sleep(Duration::from_millis(250));
         }
-        let tail = jobs::status(&ctx.home, &id).and_then(|s| jobs::tail(&s.log, 20)).unwrap_or_default();
-        ToolResult::err(format!("no device code within 30 seconds (job {id}). Log tail:\n{tail}"))
+        match jobs::status(&ctx.home, &id) {
+            Ok(s) => login_reply(&id, &s, true).unwrap_or_else(|| ToolResult::err(format!("login job {id}: no status"))),
+            Err(e) => ToolResult::err(format!("login job {id}: {e}")),
+        }
     }
+}
+
+/// Reply for the login job's current status: the code once published, a failure, or (`timed_out`) a poll instruction.
+/// `None` while the job is still running and there is nothing to report yet.
+fn login_reply(id: &str, s: &crate::server::jobs::JobStatus, timed_out: bool) -> Option<ToolResult> {
+    use crate::server::jobs::JobState;
+    if let Some(code) = s.result.as_ref().and_then(|r| r["code"].as_str()) {
+        let url = s.result.as_ref().and_then(|r| r["url"].as_str()).unwrap_or(release::DEVICE_URL);
+        return Some(ToolResult::ok(
+            format!("Show this to the user: open {url} and enter the one-time code {code}. \
+                Then poll arcus_job_status with id {id} until it is succeeded."),
+            Some(json!({"job_id": id, "code": code, "url": url}))));
+    }
+    if s.state != JobState::Running {
+        let tail = crate::server::jobs::tail(&s.log, 20).unwrap_or_default();
+        return Some(ToolResult::err(format!("login job {id} {:?}: {}\nLog tail:\n{tail}", s.state, s.message)));
+    }
+    timed_out.then(|| ToolResult::ok(
+        format!("The login job {id} is still preparing (step: {}), e.g. downloading the GitHub CLI. \
+            Poll arcus_job_status with id {id}: as soon as its result contains `code` and `url`, show both to the user \
+            (do not call arcus_ee_login again while the job is running); keep polling until it is succeeded. \
+            If it fails, read the message and call arcus_ee_login again.", s.step),
+        Some(json!({"job_id": id, "state": "running", "step": s.step}))))
 }
 
 struct Install;
@@ -399,15 +440,20 @@ impl Tool for Install {
             return ToolResult::err(format!("Missing build tools: {}\nAsk the user to run: {}",
                 missing.join(", "), install_hint(detect_os(), &missing)));
         }
-        let token = if edition == Edition::Ee {
-            match find_token(find_gh(&ctx.home).as_deref()) {
-                Some(t) => Some(t),
-                None => return ToolResult::err("No GitHub token found for the EE edition. Call arcus_ee_login, show the code and URL to the user, then retry."),
+        let releases = if edition == Edition::Ee {
+            let tokens = find_tokens(find_gh(&ctx.home).as_deref());
+            if tokens.is_empty() {
+                return ToolResult::err(format!("No GitHub token found for the EE edition. {NO_LOGIN_HINT}"));
             }
-        } else { None };
-        let releases = match release::list_releases(edition, token.as_ref()) {
-            Ok(l) => l,
-            Err(e) => return ToolResult::err(format!("arcus_install failed to list versions: {e}")),
+            match release::list_ee_releases(&tokens) {
+                Ok((l, _)) => l,
+                Err(e) => return ToolResult::err(release::ee_failure("arcus_install failed to list versions", &e)),
+            }
+        } else {
+            match release::list_releases(edition, None) {
+                Ok(l) => l,
+                Err(e) => return ToolResult::err(format!("arcus_install failed to list versions: {e}")),
+            }
         };
         let version = match arg_opt_str(args, "version") {
             Some(v) => v,
@@ -481,8 +527,14 @@ impl Tool for ZkStart {
         }
         match zk::start(&ctx.home, port, &version) {
             Ok(pid) => {
-                let ensemble = format!("127.0.0.1:{port}");
-                ToolResult::ok(format!("ZooKeeper is running at {ensemble} (pid {pid})"), Some(json!({"ensemble": ensemble, "pid": pid})))
+                // An already running local ZooKeeper keeps the port it was started with.
+                let actual = zk::configured_port(&ctx.home).unwrap_or(port);
+                let ensemble = format!("127.0.0.1:{actual}");
+                let note = if actual != port {
+                    format!(" It was already running on port {actual}, so the requested port {port} was not used; use {ensemble}.")
+                } else { String::new() };
+                ToolResult::ok(format!("ZooKeeper is running at {ensemble} (pid {pid}).{note}"),
+                    Some(json!({"ensemble": ensemble, "pid": pid, "requested_port": port, "port": actual})))
             }
             Err(e) => ToolResult::err(format!("arcus_zk_start failed: {e}")),
         }
@@ -584,8 +636,8 @@ fn setup_with(home: &crate::server::home::Home, args: &Value, connect: Connect, 
 
     let key = build_key(edition, &version, &features);
     let prefix = home.build_prefix(&key);
-    if !prefix.join("bin").join("memcached").is_file() {
-        return ToolResult::err(format!("No build {key} found at {}. Call arcus_install with the same edition, version and features first.", prefix.display()));
+    if !crate::server::build::is_built(&prefix) {
+        return ToolResult::err(format!("No complete build {key} found at {}. Call arcus_install with the same edition, version and features first.", prefix.display()));
     }
 
     let (store, ip) = match &zk_target {
@@ -717,10 +769,12 @@ fn setup_with(home: &crate::server::home::Home, args: &Value, connect: Connect, 
     if !kept.is_empty() { text.push_str(&format!(" Kept differing znodes: {}.", kept.join(", "))); }
     if let Some(f) = &pw_file { text.push_str(&format!(" The SASL password is in {f} (mode 600); do not print it.")); }
     if !problems.is_empty() { text.push_str(&format!("\nProblems:\n- {}", problems.join("\n- "))); }
-    ToolResult::ok(text, Some(json!({
+    let structured = json!({
         "applied": true, "written": written, "problems": problems, "kept_differing": kept,
         "instance_toml": toml_path.display().to_string(), "sasl_password_file": pw_file, "plan": plan_json,
-    })))
+    });
+    // Verification problems mean the cluster setup is not usable yet: report an error, keep the details.
+    ToolResult { text, structured: Some(structured), is_error: !problems.is_empty() }
 }
 
 struct Setup;
@@ -940,6 +994,55 @@ mod tests {
     }
 
     #[test]
+    fn idle_is_clamped() {
+        assert_eq!(idle_of(&json!({})), Duration::from_millis(300));
+        assert_eq!(idle_of(&json!({"idle_ms": 5})), Duration::from_millis(5));
+        assert_eq!(idle_of(&json!({"idle_ms": u64::MAX / 4})), MAX_WAIT);
+    }
+
+    #[test]
+    fn password_guard_refuses_existing_node() {
+        use crate::server::znode::tests::MemStore;
+        use crate::server::znode::ZnodeStore;
+        let st = MemStore::default();
+        st.create("/arcus_acl", b"").unwrap();
+        st.create("/arcus_acl/grp", b"").unwrap();
+        assert!(password_guard(&st, "/arcus_acl/grp").is_ok());
+        st.create("/arcus_acl/grp/authPassword", b"SCRAM-SHA-256$secret").unwrap();
+        let r = password_guard(&st, "/arcus_acl/grp").unwrap_err();
+        assert!(r.is_error && r.text.contains("overwrite=true") && r.text.contains("Ask the user") && !r.text.contains("SCRAM"), "{}", r.text);
+        assert_eq!(auth_node("/"), "/authPassword");
+        let spec = ZkPassword.spec();
+        assert_eq!(spec.input_schema["properties"]["overwrite"]["type"], "boolean");
+    }
+
+    fn job_status(state: crate::server::jobs::JobState, step: &str, result: Option<Value>) -> crate::server::jobs::JobStatus {
+        crate::server::jobs::JobStatus {
+            id: "ee_login-1".into(), kind: crate::server::jobs::JobKind::EeLogin, state, step: step.into(),
+            message: "boom".into(), log: std::path::PathBuf::from("/nonexistent/job.log"), result, pid: None,
+        }
+    }
+
+    #[test]
+    fn login_reply_variants() {
+        use crate::server::jobs::JobState::*;
+        // still downloading gh: nothing yet, then a poll instruction on timeout
+        let s = job_status(Running, "download gh", None);
+        assert!(login_reply("j", &s, false).is_none());
+        let r = login_reply("j", &s, true).unwrap();
+        assert!(!r.is_error && r.text.contains("arcus_job_status") && r.text.contains("download gh"), "{}", r.text);
+        assert_eq!(r.structured.unwrap()["job_id"], "j");
+        // code published
+        let s = job_status(Running, "waiting for browser approval", Some(json!({"code": "ABCD-1234", "url": "https://github.com/login/device"})));
+        let r = login_reply("j", &s, false).unwrap();
+        assert!(!r.is_error && r.text.contains("ABCD-1234"), "{}", r.text);
+        assert_eq!(r.structured.unwrap()["code"], "ABCD-1234");
+        // failure
+        let r = login_reply("j", &job_status(Failed, "download gh", None), false).unwrap();
+        assert!(r.is_error && r.text.contains("boom"), "{}", r.text);
+    }
+
+    #[test]
     fn ee_tools_registered() {
         let names: Vec<_> = registry().iter().map(|t| t.spec().name).collect();
         assert!(names.contains(&"arcus_list_versions") && names.contains(&"arcus_ee_login"));
@@ -967,6 +1070,7 @@ mod tests {
             let bin = h.build_prefix(key).join("bin");
             std::fs::create_dir_all(&bin).unwrap();
             std::fs::write(bin.join("memcached"), "").unwrap();
+            std::fs::write(h.build_prefix(key).join(".arcus-installed"), "").unwrap();
         }
         fn run(h: &Home, store: &Rc<MemStore>, args: Value) -> ToolResult {
             let s = store.clone();
@@ -984,6 +1088,36 @@ mod tests {
             let h = tmp_home("missing");
             let r = run(&h, &Rc::new(MemStore::default()), json!({"name": "dev", "edition": "ee", "version": "1", "features": ["zk"], "zk": "10.0.0.1:2181"}));
             assert!(r.is_error && r.text.contains("service_code") && r.text.contains("ask the user"), "{}", r.text);
+        }
+
+        #[test]
+        fn partial_build_is_not_a_build() {
+            let h = tmp_home("partial");
+            let bin = h.build_prefix("ee-0.12.1-zk").join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join("memcached"), "").unwrap(); // no .arcus-installed marker
+            let r = run(&h, &Rc::new(MemStore::default()), args(json!({})));
+            assert!(r.is_error && r.text.contains("arcus_install"), "{}", r.text);
+        }
+
+        #[test]
+        fn verify_problems_are_an_error_with_details() {
+            struct NoChildren(MemStore);
+            impl ZnodeStore for NoChildren {
+                fn get(&self, p: &str) -> std::io::Result<Option<Vec<u8>>> { self.0.get(p) }
+                fn create(&self, p: &str, v: &[u8]) -> std::io::Result<()> { self.0.create(p, v) }
+                fn set(&self, p: &str, v: &[u8]) -> std::io::Result<()> { self.0.set(p, v) }
+                fn children(&self, _p: &str) -> std::io::Result<Vec<String>> { Ok(Vec::new()) }
+            }
+            let h = tmp_home("problems");
+            fake_build(&h, "ee-0.12.1-zk");
+            let st: Rc<dyn ZnodeStore> = Rc::new(NoChildren(MemStore::default()));
+            let r = setup_with(&h, &args(json!({"apply": true})), &move |_| Ok(st.clone()), &|_| Ok("10.0.0.1".parse().unwrap()));
+            assert!(r.is_error, "{}", r.text);
+            assert!(r.text.contains("Problems:"));
+            let sc = r.structured.unwrap();
+            assert_eq!(sc["applied"], true);
+            assert_eq!(sc["problems"].as_array().unwrap().len(), 1);
         }
 
         #[test]

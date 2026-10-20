@@ -90,15 +90,63 @@ pub fn download_source(rel: &Release, token: Option<&Token>, home: &Home) -> io:
     fetch_cached(&req, &home.downloads().join(&rel.asset_name), sum.as_ref())
 }
 
-/// `GITHUB_TOKEN`, then `<gh> auth token` (read-only).
-pub fn find_token(gh: Option<&Path>) -> Option<Token> {
-    if let Some(t) = std::env::var("GITHUB_TOKEN").ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
-        return Some(Token(t));
-    }
-    let out = Command::new(gh?).args(["auth", "token"]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+/// The token `<gh> auth token` prints (read-only).
+pub fn gh_token(gh: &Path) -> Option<Token> {
+    let out = Command::new(gh).args(["auth", "token"]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
     if !out.status.success() { return None; }
     let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if t.is_empty() { None } else { Some(Token(t)) }
+}
+
+fn env_token() -> Option<Token> {
+    std::env::var("GITHUB_TOKEN").ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).map(Token)
+}
+
+/// Candidate tokens in preference order: `GITHUB_TOKEN`, then the gh login (when it differs).
+pub fn candidate_tokens(env: Option<Token>, gh: Option<Token>) -> Vec<Token> {
+    let mut v: Vec<Token> = env.into_iter().collect();
+    if let Some(g) = gh && !v.iter().any(|t| t.0 == g.0) { v.push(g); }
+    v
+}
+
+/// All usable tokens: `GITHUB_TOKEN`, then `<gh> auth token`.
+pub fn find_tokens(gh: Option<&Path>) -> Vec<Token> {
+    candidate_tokens(env_token(), gh.and_then(gh_token))
+}
+
+/// Runs `f` with each token in turn. A token GitHub rejects (401/403/404) falls through to the next one,
+/// so a stale `GITHUB_TOKEN` does not hide a working gh login. Returns the result and the token that worked.
+pub fn with_tokens<T>(tokens: &[Token], mut f: impl FnMut(&Token) -> io::Result<T>) -> io::Result<(T, Token)> {
+    let mut last = io::Error::new(io::ErrorKind::PermissionDenied, "no GitHub token available");
+    for t in tokens {
+        match f(t) {
+            Ok(v) => return Ok((v, t.clone())),
+            Err(e) if matches!(e.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound) => last = e,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last)
+}
+
+/// EE releases using the first token that GitHub accepts; returns that token too.
+pub fn list_ee_releases(tokens: &[Token]) -> io::Result<(Vec<Release>, Token)> {
+    with_tokens(tokens, |t| list_releases(Edition::Ee, Some(t)))
+}
+
+/// Message for a failed EE call: the shared access guidance for auth errors, otherwise `<what>: <error>`.
+pub fn ee_failure(what: &str, e: &io::Error) -> String {
+    if matches!(e.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound) { ee_access_error(e) } else { format!("{what}: {e}") }
+}
+
+/// Shared explanation for "GitHub refused access to the EE repository", used by every EE tool.
+pub fn ee_access_error(e: &io::Error) -> String {
+    format!("GitHub denied access to the EE repository {EE_REPO} ({e}). Possible causes: \
+        (1) the GitHub account has no access to {EE_REPO} (ask the user to check their membership); \
+        (2) a stale GITHUB_TOKEN is set and the gh login was not accepted either; \
+        (3) the organization restricts OAuth apps, so the gh login token is rejected. \
+        For (2) and (3) ask the user to create a personal access token with read access to the repository \
+        and set it as GITHUB_TOKEN in the env of this MCP server in the MCP client configuration, then restart the client. \
+        Do not ask the user to paste a token into the conversation. If the user was never logged in, call arcus_ee_login.")
 }
 
 pub fn find_gh(home: &Home) -> Option<PathBuf> {
@@ -151,7 +199,8 @@ fn extract_gh(archive: &Path, dest: &Path) -> io::Result<()> {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp)?;
         // The system `unzip` is present on macOS; avoids a zip crate dependency.
-        let st = Command::new("unzip").arg("-q").arg("-o").arg(archive).arg("-d").arg(&tmp).status()?;
+        let st = Command::new("unzip").arg("-q").arg("-o").arg(archive).arg("-d").arg(&tmp)
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status()?;
         if !st.success() { return Err(io::Error::other("unzip failed")); }
         for e in std::fs::read_dir(&tmp)? {
             let bin = e?.path().join("bin");
@@ -192,7 +241,13 @@ pub fn parse_device_code(text: &str) -> Option<String> {
 
 /// `EeLogin` job: `gh auth login --web`, publishing the device code as soon as gh prints it.
 pub fn ee_login_job(ctx: &JobCtx, _params: &Value) -> Result<Value, String> {
-    let gh = find_gh(&ctx.home).ok_or("gh is not installed")?;
+    let gh = match find_gh(&ctx.home) {
+        Some(gh) => gh,
+        None => {
+            ctx.step("download gh");
+            download_gh(&ctx.home).map_err(|e| format!("GitHub CLI (gh) is not installed and downloading it failed: {e}"))?
+        }
+    };
     ctx.step("starting gh");
     let log = std::fs::OpenOptions::new().create(true).append(true).open(&ctx.log).map_err(|e| e.to_string())?;
     let mut child = Command::new(&gh)
@@ -231,8 +286,9 @@ pub fn ee_login_job(ctx: &JobCtx, _params: &Value) -> Result<Value, String> {
     let status = child.wait().map_err(|e| e.to_string())?;
     if !status.success() { return Err(format!("gh auth login failed ({status})")); }
     ctx.step("verifying access");
-    let token = find_token(Some(&gh)).ok_or("login finished but no token is available")?;
-    let versions = list_releases(Edition::Ee, Some(&token)).map_err(|e| format!("EE access check failed: {e}"))?;
+    // Check the login token itself, not GITHUB_TOKEN, which may be stale.
+    let token = gh_token(&gh).ok_or("login finished but no token is available")?;
+    let versions = list_releases(Edition::Ee, Some(&token)).map_err(|e| ee_access_error(&e))?;
     Ok(json!({"code": code, "url": DEVICE_URL, "ee_versions": versions.len()}))
 }
 
@@ -245,6 +301,42 @@ mod tests {
         let mut a = json!({"name": asset, "url": format!("https://api.github.com/a/{asset}")});
         if let Some(d) = digest { a["digest"] = json!(d); }
         json!({"tag_name": tag, "assets": [a]})
+    }
+
+    fn tok(s: &str) -> Token { Token(s.to_string()) }
+
+    #[test]
+    fn candidates_prefer_env_and_dedupe() {
+        let v = candidate_tokens(Some(tok("a")), Some(tok("b")));
+        assert_eq!(v.iter().map(|t| t.0.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(candidate_tokens(Some(tok("a")), Some(tok("a"))).len(), 1);
+        assert_eq!(candidate_tokens(None, Some(tok("b"))).len(), 1);
+        assert!(candidate_tokens(None, None).is_empty());
+    }
+
+    #[test]
+    fn rejected_token_falls_back_to_next() {
+        let denied = || io::Error::new(io::ErrorKind::PermissionDenied, "HTTP 401");
+        let mut seen = Vec::new();
+        let (v, used) = with_tokens(&[tok("stale"), tok("good")], |t| {
+            seen.push(t.0.clone());
+            if t.0 == "stale" { Err(denied()) } else { Ok(7) }
+        }).unwrap();
+        assert_eq!((v, used.0.as_str()), (7, "good"));
+        assert_eq!(seen, ["stale", "good"]);
+        // all rejected -> last error; non-auth errors are not retried
+        let e = with_tokens(&[tok("a"), tok("b")], |_| -> io::Result<()> { Err(denied()) }).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        let mut n = 0;
+        let e = with_tokens(&[tok("a"), tok("b")], |_| -> io::Result<()> { n += 1; Err(io::Error::other("net")) }).unwrap_err();
+        assert_eq!((n, e.kind()), (1, io::ErrorKind::Other));
+        assert!(with_tokens::<()>(&[], |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn ee_access_error_guides_without_secrets() {
+        let m = ee_access_error(&io::Error::new(io::ErrorKind::PermissionDenied, "GET https://x failed: HTTP 403"));
+        assert!(m.contains("GITHUB_TOKEN") && m.contains("OAuth") && m.contains("HTTP 403") && m.contains("arcus_ee_login"), "{m}");
     }
 
     #[test]
