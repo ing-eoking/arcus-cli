@@ -117,8 +117,9 @@ args = ["--mcp"]
 ### EE login
 
 `arcus_ee_login` starts the GitHub device flow. It returns a one-time code and
-a URL; open the URL, enter the code and approve. The token is kept by
-`arcus-cli` and never passes through the AI conversation. Afterwards
+a URL; open the URL, enter the code and approve. The token stays in gh's own
+credential store; `arcus-cli` does not save it, and it never passes through the
+AI conversation. Afterwards
 `arcus_list_versions` and `arcus_install` work for `edition: "ee"`.
 
 ### Files

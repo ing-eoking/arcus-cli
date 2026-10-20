@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use super::features::{configure_args, Feature};
 use super::features::Edition;
 use super::jobs::{tail, JobCtx};
-use super::release::{download_source, find_gh, find_token, list_releases};
+use super::release::{download_source, ee_failure, find_gh, find_tokens, list_ee_releases, list_releases};
 use serde_json::{json, Value};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -40,7 +40,7 @@ pub fn detect_os() -> Os {
 /// Returns required build tools for which `have` is false (`libtool` is probed as `glibtool` on macOS).
 pub fn missing_tools(have: &dyn Fn(&str) -> bool) -> Vec<&'static str> {
     let mac = cfg!(target_os = "macos");
-    ["cc", "make", "libtool", "perl", "autoconf", "automake"]
+    ["cc", "make", "libtool", "perl"]
         .into_iter()
         .filter(|&t| {
             let probe = if mac && t == "libtool" { "glibtool" } else { t };
@@ -63,10 +63,10 @@ pub fn on_path(name: &str) -> bool {
 /// Install guidance shown to the user; never executed.
 pub fn install_hint(os: Os, missing: &[&str]) -> String {
     match os {
-        Os::Rhel => "sudo dnf install gcc make libtool perl autoconf automake".into(),
-        Os::Debian => "sudo apt-get install build-essential libtool perl autoconf automake".into(),
+        Os::Rhel => "sudo dnf install gcc make libtool perl".into(),
+        Os::Debian => "sudo apt-get install build-essential libtool perl".into(),
         Os::Mac => {
-            let mut s = String::from("brew install libtool autoconf automake");
+            let mut s = String::from("brew install libtool");
             if missing.iter().any(|t| *t == "cc" || *t == "make") {
                 s.push_str("\nxcode-select --install");
             }
@@ -111,10 +111,18 @@ fn append_file(log: &Path, file: &Path) {
     }
 }
 
-/// Builds the source tarball into `prefix`; skipped when `<prefix>/bin/memcached` already exists.
+/// Written after a successful `make install`; its absence means the prefix is missing or only partly built.
+const INSTALLED_MARKER: &str = ".arcus-installed";
+
+/// Whether `prefix` holds a complete build (a partly installed prefix has `bin/memcached` but no marker).
+pub fn is_built(prefix: &Path) -> bool { prefix.join(INSTALLED_MARKER).is_file() }
+
+/// Builds the source tarball into `prefix`; skipped when the prefix is already completely built.
+/// A prefix without the marker is cleared and rebuilt.
 pub fn build(tarball: &Path, prefix: &Path, features: &BTreeSet<Feature>, log: &Path,
              runner: &mut dyn Runner, step: &dyn Fn(&str)) -> io::Result<()> {
-    if prefix.join("bin").join("memcached").is_file() { return Ok(()); }
+    if is_built(prefix) { return Ok(()); }
+    let _ = std::fs::remove_dir_all(prefix);
     let src_parent = PathBuf::from(format!("{}.src", prefix.display()));
     let src = extract(tarball, &src_parent)?;
     let fail = |name: &str| io::Error::other(format!(
@@ -136,6 +144,8 @@ pub fn build(tarball: &Path, prefix: &Path, features: &BTreeSet<Feature>, log: &
         if name == "deps" { append_file(log, &src.join("deps").join("install.log")); }
         if !ok { return Err(fail(name)); }
     }
+    std::fs::create_dir_all(prefix)?;
+    std::fs::write(prefix.join(INSTALLED_MARKER), "")?;
     Ok(())
 }
 
@@ -154,17 +164,22 @@ pub fn install_job(ctx: &JobCtx, params: &Value) -> Result<Value, String> {
     let version = params["version"].as_str().ok_or("missing version")?.to_string();
     let key = params["build_key"].as_str().ok_or("missing build_key")?.to_string();
     let features: BTreeSet<Feature> = serde_json::from_value(params["features"].clone()).map_err(|e| e.to_string())?;
-    let token = if edition == Edition::Ee { find_token(find_gh(&ctx.home).as_deref()) } else { None };
-    if edition == Edition::Ee && token.is_none() {
+    let tokens = if edition == Edition::Ee { find_tokens(find_gh(&ctx.home).as_deref()) } else { Vec::new() };
+    if edition == Edition::Ee && tokens.is_empty() {
         return Err("no GitHub token found; call arcus_ee_login first".into());
     }
     let prefix = ctx.home.build_prefix(&key);
-    if !prefix.join("bin").join("memcached").is_file() {
+    if !is_built(&prefix) {
         ctx.step("download");
-        let rel = list_releases(edition, token.as_ref()).map_err(|e| e.to_string())?
-            .into_iter().find(|r| r.version == version)
+        let (releases, token) = if edition == Edition::Ee {
+            let (r, t) = list_ee_releases(&tokens).map_err(|e| ee_failure("failed to list EE releases", &e))?;
+            (r, Some(t))
+        } else {
+            (list_releases(edition, None).map_err(|e| e.to_string())?, None)
+        };
+        let rel = releases.into_iter().find(|r| r.version == version)
             .ok_or_else(|| format!("version {version} not found"))?;
-        let tarball = download_source(&rel, token.as_ref(), &ctx.home).map_err(|e| e.to_string())?;
+        let tarball = download_source(&rel, token.as_ref(), &ctx.home).map_err(|e| ee_failure("download failed", &e))?;
         build(&tarball, &prefix, &features, &ctx.log, &mut RealRunner, &|s| ctx.step(s)).map_err(|e| e.to_string())?;
     }
     Ok(json!({"build_key": key, "prefix": prefix.display().to_string()}))
@@ -218,6 +233,7 @@ mod tests {
         let mut r = Rec { calls: vec![], envs: vec![], fail_on: None };
         let steps = std::cell::RefCell::new(Vec::new());
         build(&tarball, &prefix, &features, &d.join("job.log"), &mut r, &|s| steps.borrow_mut().push(s.to_string())).unwrap();
+        assert!(is_built(&prefix));
         let progs: Vec<_> = r.calls.iter().map(|c| c.0.as_str()).collect();
         assert_eq!(progs, ["./deps/install.sh", "./configure", "make", "make"]);
         assert_eq!(r.calls[1].1, configure_args(&features, &prefix));
@@ -243,6 +259,24 @@ mod tests {
         let e = build(&tarball, &d.join("prefix"), &BTreeSet::new(), &log, &mut r, &|_| {}).unwrap_err();
         let m = e.to_string();
         assert!(m.contains("make") && m.contains(&log.display().to_string()), "{m}");
+        assert!(!is_built(&d.join("prefix")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn partial_install_is_rebuilt() {
+        let d = tmp("partial");
+        let tarball = tiny_tarball(&d);
+        let prefix = d.join("prefix");
+        // bin/memcached exists but the marker does not (an earlier install died half way)
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::fs::write(prefix.join("bin/memcached"), "").unwrap();
+        std::fs::write(prefix.join("stale"), "").unwrap();
+        assert!(!is_built(&prefix));
+        let mut r = Rec { calls: vec![], envs: vec![], fail_on: None };
+        build(&tarball, &prefix, &BTreeSet::new(), &d.join("l"), &mut r, &|_| {}).unwrap();
+        assert_eq!(r.calls.len(), 4);
+        assert!(is_built(&prefix) && !prefix.join("stale").exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -252,6 +286,7 @@ mod tests {
         let prefix = d.join("prefix");
         std::fs::create_dir_all(prefix.join("bin")).unwrap();
         std::fs::write(prefix.join("bin/memcached"), "").unwrap();
+        std::fs::write(prefix.join(INSTALLED_MARKER), "").unwrap();
         let mut r = Rec { calls: vec![], envs: vec![], fail_on: None };
         build(&d.join("missing.tar.gz"), &prefix, &BTreeSet::new(), &d.join("l"), &mut r, &|_| {}).unwrap();
         assert!(r.calls.is_empty());
@@ -270,7 +305,7 @@ mod tests {
         let ctx = JobCtx { id: "install-test".into(), home: home.clone(), log: log.clone() };
         let r = install_job(&ctx, &json!({"edition": "public", "version": "1.16.1", "features": ["zk"], "build_key": key}));
         let prefix = home.build_prefix(&key);
-        let ok = r.is_ok() && prefix.join("bin/memcached").is_file()
+        let ok = r.is_ok() && is_built(&prefix) && prefix.join("bin/memcached").is_file()
             && prefix.join("lib/default_engine.so").is_file() && prefix.join("lib/userlog_logger.so").is_file();
         if !ok { eprintln!("{r:?}\n{}", tail(&log, 40).unwrap_or_default()); }
         let _ = std::fs::remove_dir_all(&root);
@@ -286,5 +321,7 @@ mod tests {
     fn missing_uses_glibtool_on_mac_and_reports_absent() {
         let m = missing_tools(&|t| t != "perl" && t != "make");
         assert_eq!(m, ["make", "perl"]);
+        // release tarballs ship `configure`; autotools are not required
+        assert!(missing_tools(&|t| t != "autoconf" && t != "automake").is_empty());
     }
 }
