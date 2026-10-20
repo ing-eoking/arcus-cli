@@ -75,8 +75,14 @@
 
 ### 장비 등록과 SSH
 
-- `arcus_host_add {name, host, user, port?: 22, identity_file?}`: 장비 정보를 `~/.arcus-cli/hosts.toml`에 저장한다.
-  비밀번호는 저장하지 않는다. 이름은 사용자에게 묻는다(예: dev-1).
+- `~/.ssh/config`에 이미 그 장비의 접속 설정이 있으면 접속 정보를 묻지 않고 그 설정을 그대로 쓴다(사용자 결정).
+  - `arcus_host_add {name}`만으로 등록할 수 있다. `name`이 `~/.ssh/config`의 `Host` 별칭(와일드카드 아닌 항목,
+    `Include`된 파일 포함)과 같으면 ssh에 별칭을 그대로 넘기고, `ssh -G <name>`으로 해석된 호스트·사용자·포트를
+    결과에 보여준다. hosts.toml에는 "ssh config 별칭"이라고만 기록한다.
+  - `arcus_host_list_ssh_config {}`: `~/.ssh/config`의 별칭 목록을 돌려줘 AI가 장비 선택을 제안할 수 있게 한다.
+- ssh config에 없으면 `arcus_host_add {name, host, user, port?: 22, identity_file?}`로 접속 정보를 받아
+  `~/.arcus-cli/hosts.toml`에 저장한다. 비밀번호는 저장하지 않는다. 이름은 사용자에게 묻는다(예: dev-1).
+- 공통 SSH 옵션(아래)은 ssh config 설정 위에 덧붙인다. 사용자의 `ProxyJump`, `IdentityFile` 등은 그대로 적용된다.
 - 모든 SSH/scp는 시스템 `ssh`/`scp`를 실행한다. 공통 옵션:
   - `ControlMaster=auto`, `ControlPath=~/.arcus-cli/ssh/%C`, `ControlPersist=10m`: 장비마다 한 번 인증하면 재사용.
   - `BatchMode`는 쓰지 않고, 비밀번호가 필요하면 `SSH_ASKPASS=<arcus-cli askpass 헬퍼>`,
