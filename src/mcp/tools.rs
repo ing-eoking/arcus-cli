@@ -1,5 +1,6 @@
 use super::{arg_bool, arg_opt_str, arg_str, arg_u64, Ctx, Tool, ToolResult, ToolSpec};
 use crate::connect::collect_responses;
+use crate::remote::forward::Remote;
 use crate::server::build::{detect_os, install_hint, missing_tools, on_path};
 use crate::server::features::{Edition, Feature};
 use crate::server::release::{self, find_gh, find_tokens};
@@ -15,24 +16,24 @@ const MAX_BYTES: usize = 1 << 20;
 /// All tools exposed by `arcus-cli --mcp` (later tasks append here).
 pub fn registry() -> Vec<Box<dyn Tool>> {
     let mut v: Vec<Box<dyn Tool>> = vec![
-        Box::new(MemcachedCommand),
-        Box::new(ZkLs),
-        Box::new(ZkGet),
-        Box::new(ZkCreate),
-        Box::new(ZkSet),
-        Box::new(ZkPassword),
-        Box::new(ListFeatures),
-        Box::new(CheckPrerequisites),
-        Box::new(JobStatusTool),
-        Box::new(ListVersions),
-        Box::new(EeLogin),
-        Box::new(Install),
-        Box::new(ZkStart),
-        Box::new(ZkStop),
-        Box::new(Setup),
-        Box::new(Start),
-        Box::new(Stop),
-        Box::new(StatusTool),
+        Box::new(Remote(MemcachedCommand)),
+        Box::new(Remote(ZkLs)),
+        Box::new(Remote(ZkGet)),
+        Box::new(Remote(ZkCreate)),
+        Box::new(Remote(ZkSet)),
+        Box::new(Remote(ZkPassword)),
+        Box::new(Remote(ListFeatures)),
+        Box::new(Remote(CheckPrerequisites)),
+        Box::new(Remote(JobStatusTool)),
+        Box::new(Remote(ListVersions)),
+        Box::new(Remote(EeLogin)),
+        Box::new(Remote(Install)),
+        Box::new(Remote(ZkStart)),
+        Box::new(Remote(ZkStop)),
+        Box::new(Remote(Setup)),
+        Box::new(Remote(Start)),
+        Box::new(Remote(Stop)),
+        Box::new(Remote(StatusTool)),
     ];
     v.extend(super::remote_tools::registry());
     v
