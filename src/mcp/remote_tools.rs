@@ -3,7 +3,8 @@
 
 use super::{arg_bool, arg_opt_str, arg_str, arg_u64, Ctx, Tool, ToolResult, ToolSpec};
 use crate::remote::machines::{load_machines, resolve, save_machine, ssh_config_aliases, Machine, Target};
-use crate::remote::ssh::{HostKeyPolicy, Runner, Ssh, SshError, SystemRunner};
+use crate::remote::forward::ssh_error_result;
+use crate::remote::ssh::{HostKeyPolicy, Runner, Ssh, SystemRunner};
 use crate::server::home::Home;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -92,20 +93,6 @@ pub fn host_list(home: &Home) -> ToolResult {
 
 const CHECK_CMD: &str = "uname -sm; echo $HOME; ~/.arcus-cli/bin/arcus-cli --version 2>/dev/null; \
 test -S ~/.arcus-cli/agent.sock && ~/.arcus-cli/bin/arcus-cli --agent-status --home ~/.arcus-cli";
-
-/// Maps an SSH failure to a tool error the AI can act on.
-pub fn ssh_error_result(e: SshError) -> ToolResult {
-    match e {
-        SshError::HostKeyUnknown { fingerprint } => ToolResult::err(format!(
-            "unknown host key (fingerprint: {fingerprint}). Show this fingerprint to the user; only after the user agrees, \
-call again with accept_host_key: true")),
-        SshError::HostKeyChanged => ToolResult::err(
-            "the host key has CHANGED (possible man-in-the-middle). Do not retry; tell the user to verify the machine"),
-        SshError::AuthFailed { hint } => ToolResult::err(format!("authentication failed: {hint}")),
-        SshError::Unreachable(m) => ToolResult::err(format!("machine unreachable: {m}")),
-        SshError::Remote { status, stderr } => ToolResult::err(format!("remote command failed ({status}): {}", stderr.trim())),
-    }
-}
 
 pub fn parse_check(stdout: &str) -> Result<Value, String> {
     let mut lines = stdout.lines();
