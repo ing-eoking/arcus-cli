@@ -67,3 +67,63 @@ Once installed, you can simply run:
 ```bash
 arcus-cli --host 127.0.0.1
 ```
+
+## MCP mode
+
+`arcus-cli --mcp` runs a stdio [MCP](https://modelcontextprotocol.io) server
+so an AI client can operate ARCUS for you: talk to a cache server, browse
+ZooKeeper, and build, configure and run ARCUS servers from source.
+Long operations (build, download, login) run as background jobs that the
+client polls with `arcus_job_status`.
+
+### Registering the server
+
+```bash
+# Claude Code
+claude mcp add arcus -- arcus-cli --mcp
+```
+
+Gemini CLI, `~/.gemini/settings.json`:
+
+```json
+{"mcpServers": {"arcus": {"command": "arcus-cli", "args": ["--mcp"]}}}
+```
+
+Codex, `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.arcus]
+command = "arcus-cli"
+args = ["--mcp"]
+```
+
+### Tools
+
+| Tool | Purpose |
+|------|---------|
+| `memcached_command` | Send ASCII commands to a cache server (TCP or Unix socket) |
+| `zk_ls` / `zk_get` / `zk_create` / `zk_set` | Browse and edit ZooKeeper znodes |
+| `zk_password` | Store a generated SCRAM-SHA-256 secret in ZooKeeper; the password goes to a private file, never into the conversation |
+| `arcus_list_features` | Optional build features per edition (public / ee) |
+| `arcus_check_prerequisites` | Report missing build tools and the command to install them |
+| `arcus_list_versions` | Installable server versions per edition |
+| `arcus_ee_login` | GitHub device-code login for the private EE sources |
+| `arcus_install` | Build and install a server from source (background job) |
+| `arcus_job_status` | Poll a background job |
+| `arcus_zk_start` / `arcus_zk_stop` | Start or stop a local single-node ZooKeeper (downloads it first if needed) |
+| `arcus_setup` | Define a server instance and create its znodes; plan only unless `apply=true` |
+| `arcus_start` / `arcus_stop` / `arcus_status` | Run, stop and inspect instances (`arcus_stop` uses SIGTERM; `force` sends SIGKILL) |
+
+### EE login
+
+`arcus_ee_login` starts the GitHub device flow. It returns a one-time code and
+a URL; open the URL, enter the code and approve. The token is kept by
+`arcus-cli` and never passes through the AI conversation. Afterwards
+`arcus_list_versions` and `arcus_install` work for `edition: "ee"`.
+
+### Files
+
+Everything lives under `~/.arcus-cli/` (override with `--home <dir>`):
+downloaded sources and builds, the local ZooKeeper, job logs, and
+`instances/<name>/` for each instance (configuration, logs and, with SASL,
+the generated `sasl_password`).
