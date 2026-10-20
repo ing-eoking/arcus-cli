@@ -18,7 +18,7 @@
 ## 목표
 
 - MCP 도구로 원격 장비를 등록하고(접속 정보는 사용자에게 묻는다), 상주 arcus-cli를 설치·기동한다.
-- 기존 도구(설치, ZK, setup, start/stop/status, memcached/zk 명령)를 `host` 인자로 원격 장비에서 실행한다.
+- 기존 도구(설치, ZK, setup, start/stop/status, memcached/zk 명령)를 `machine` 인자로 원격 장비에서 실행한다.
 - 여러 장비에 걸친 ZK 앙상블을 띄운다(추천: 장비마다 1노드, 사용자가 자유롭게 바꿀 수 있음).
 - 장비별 캐시 서버와 복제 그룹(예: master dev-1, slave dev-2)을 구성한다.
 
@@ -53,7 +53,7 @@
 
 ### 구성 요소
 
-- **맥(로컬) MCP 서버** `arcus-cli --mcp`: 기존 그대로. 도구에 `host` 인자가 있으면 그 장비로 전달한다.
+- **맥(로컬) MCP 서버** `arcus-cli --mcp`: 기존 그대로. 도구에 `machine` 인자가 있으면 그 장비로 전달한다.
 - **원격 상주 에이전트** `arcus-cli --agent --home <dir>`: 장비마다 하나. `<home>/agent.sock`(Unix 소켓, 권한 600)으로
   같은 장비 안에서만 요청을 받는다. 서버·ZK 노드마다 1번의 감독 프로세스(`--supervise`)를 띄워 관리한다.
 - **프로세스 구조 (사용자 결정)**: 에이전트 → 서버·ZK마다 감독 프로세스 → memcached / java(ZK).
@@ -116,7 +116,7 @@
 
 - 기존 도구에 `machine?: <장비 이름>` 인자를 추가한다. 없으면 지금처럼 로컬에서 실행한다.
 - 원격이면 맥 MCP가 `ssh <장비> ~/.arcus-cli/bin/arcus-cli --call <tool> --home ~/.arcus-cli`를 실행하고 JSON 인자를
-  stdin으로 넘긴다. 결과 JSON을 받아 `host` 정보를 붙여 돌려준다.
+  stdin으로 넘긴다. 결과 JSON을 받아 장비 이름을 붙여 돌려준다.
 - 오래 걸리는 작업(빌드, ZK 다운로드, EE 로그인)은 원격 장비의 job으로 돌고, `arcus_job_status {machine, id}`로 본다.
 - EE 로그인(`arcus_ee_login {machine}`)은 원격 장비의 gh가 일회용 코드를 내고, 승인은 맥 브라우저에서 한다.
   키체인이 없는 원격 장비에서는 gh가 토큰을 `~/.config/gh/hosts.yml`(권한 600)에 평문 저장한다. 그래서 원격 로그인은
