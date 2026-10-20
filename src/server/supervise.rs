@@ -173,8 +173,19 @@ pub fn start(home: &Home, name: &InstanceName) -> io::Result<u32> {
         std::thread::sleep(POLL);
     }
     let died = p.last_exit().exists() || !is_running(&p.server_pid(), "memcached");
-    Err(io::Error::other(format!("server did not answer `version` on port {} ({}){}", cfg.port,
-        if died { "the server exited" } else { "timed out after 5 s" }, diagnostics(&p))))
+    let pid = read_pid(&p.server_pid());
+    Err(io::Error::other(format!("{}{}", start_failure(cfg.port, died, pid), diagnostics(&p))))
+}
+
+/// Why `start` gave up: the server exited, or it is alive but did not answer within the wait.
+fn start_failure(port: u16, died: bool, pid: Option<u32>) -> String {
+    if died {
+        format!("server did not answer `version` on port {port} (the server exited)")
+    } else {
+        format!("server did not answer `version` on port {port} within 5 s, but it is still running{}; \
+            it may still be starting. Check again with arcus_status, or stop it with arcus_stop.",
+            pid.map(|p| format!(" (pid {p})")).unwrap_or_default())
+    }
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -246,6 +257,14 @@ pub fn status(home: &Home, name: Option<&InstanceName>) -> io::Result<Vec<Status
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn start_failure_messages() {
+        use super::start_failure;
+        assert!(start_failure(11211, true, None).contains("the server exited"));
+        let m = start_failure(11211, false, Some(42));
+        assert!(m.contains("still running") && m.contains("pid 42") && m.contains("arcus_stop") && !m.contains("exited"), "{m}");
+    }
+
     use super::*;
 
     #[test]

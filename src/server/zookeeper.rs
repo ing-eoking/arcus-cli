@@ -156,6 +156,16 @@ fn ensure_port_free(port: u16) -> io::Result<()> {
     Ok(())
 }
 
+/// `clientPort` of a zoo.cfg text.
+pub fn parse_client_port(cfg: &str) -> Option<u16> {
+    cfg.lines().find_map(|l| l.trim().strip_prefix("clientPort=")).and_then(|v| v.trim().parse().ok())
+}
+
+/// Client port the local ZooKeeper was configured with (from the zoo.cfg written by `start`).
+pub fn configured_port(home: &Home) -> Option<u16> {
+    parse_client_port(&std::fs::read_to_string(home.zk_dir().join("zoo.cfg")).ok()?)
+}
+
 pub fn start(home: &Home, port: u16, version: &str) -> io::Result<u32> {
     if let Some(pid) = live_java_pid(home) { return Ok(pid); }
     if !valid_version(version) { return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid ZooKeeper version `{version}`"))); }
@@ -213,6 +223,10 @@ pub fn stop(home: &Home) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    #[test] fn client_port_from_cfg() {
+        assert_eq!(parse_client_port(&zoo_cfg(2191, Path::new("/d"))), Some(2191));
+        assert_eq!(parse_client_port("tickTime=2000\n"), None);
+    }
     #[test] fn cfg() { let c = zoo_cfg(2181, Path::new("/d")); assert!(c.contains("clientPort=2181\n") && c.contains("dataDir=/d\n") && c.contains("4lw.commands.whitelist=ruok\n")); }
     #[test] fn java_versions() {
         assert_eq!(java_major("openjdk version \"1.8.0_392\""), Some(8));
