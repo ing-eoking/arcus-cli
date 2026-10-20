@@ -242,7 +242,12 @@ const CLUSTER_ZK_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 fn machine_address(home: &Home, runner: &dyn Runner, config: &Path, machine: &str) -> Result<String, String> {
     let m = resolve(home, machine, config)?;
     let ssh = Ssh { home, runner, machine: &m, policy: HostKeyPolicy::Strict };
-    let o = ssh.exec("hostname -I 2>/dev/null || ipconfig getifaddr en0", b"").map_err(|e| ssh_error_result(e).text)?;
+    let o = ssh.exec("hostname -I 2>/dev/null || ipconfig getifaddr en0", b"").map_err(|e| match e {
+        crate::remote::ssh::SshError::HostKeyUnknown { fingerprint } => format!(
+            "unknown host key for `{machine}` (fingerprint: {fingerprint}). Show this fingerprint to the user; only after the user agrees, \
+call arcus_host_check with machine: \"{machine}\" and accept_host_key: true, then retry"),
+        e => ssh_error_result(e).text,
+    })?;
     String::from_utf8_lossy(&o.stdout).split_whitespace().next().map(str::to_string)
         .ok_or_else(|| format!("could not determine an address of `{machine}`; ask the user for it"))
 }
@@ -317,7 +322,24 @@ pub fn cluster_zk_start(args: &Value, fwd: &dyn Fn(&str, &Value, &str) -> ToolRe
         if let Some(v) = args.get("version").filter(|v| !v.is_null()) { a["version"] = v.clone(); }
         let r = fwd("arcus_zk_start", &a, m);
         if r.is_error { return ToolResult::err(format!("starting ZooKeeper on `{m}` failed: {}", r.text)); }
-        if let Some(job) = r.structured.as_ref().and_then(|s| s.get("job_id")) { jobs.push(json!({"machine": m, "job_id": job})); }
+        let st = r.structured.as_ref();
+        if st.and_then(|s| s.get("already_running")).and_then(Value::as_bool) == Some(true) {
+            let same = st.and_then(|s| s["ensemble"].as_str()) == Some(ensemble.as_str())
+                && st.and_then(|s| s["nodes"].as_array()).is_some_and(|l| {
+                    let mut got: Vec<u64> = l.iter().filter_map(|n| n["id"].as_u64()).collect();
+                    got.sort_unstable();
+                    let mut want = my_ids.clone();
+                    want.sort_unstable();
+                    got == want
+                });
+            if !same {
+                return ToolResult::err(format!(
+                    "`{m}` already runs a local ZooKeeper ensemble with different settings ({}); nothing new was started there. \
+Ask the user: stop it with arcus_zk_stop {{machine: \"{m}\"}} and call arcus_cluster_zk_start again, or reuse that ensemble instead.",
+                    st.and_then(|s| s["ensemble"].as_str()).unwrap_or("unknown ensemble")));
+            }
+        }
+        if let Some(job) = st.and_then(|s| s.get("job_id")) { jobs.push(json!({"machine": m, "job_id": job})); }
     }
     if !jobs.is_empty() {
         return ToolResult::ok(
@@ -326,26 +348,34 @@ then call arcus_cluster_zk_start again with the same nodes.", Some(json!({"jobs"
     }
     let deadline = std::time::Instant::now() + wait;
     let mut modes: Vec<Option<String>> = vec![None; parsed.len()];
+    let mut failed: Vec<Option<String>> = vec![None; parsed.len()];
     loop {
         for (i, (_, m, _, c, ..)) in parsed.iter().enumerate() {
-            if modes[i].is_some() { continue; }
+            if modes[i].is_some() || failed[i].is_some() { continue; }
             let r = fwd("arcus_zk_mode", &json!({"port": c}), m);
+            if r.is_error { failed[i] = Some(r.text); continue; }
             modes[i] = r.structured.as_ref().and_then(|s| s["mode"].as_str()).map(str::to_string);
         }
-        if modes.iter().all(Option::is_some) || std::time::Instant::now() >= deadline { break; }
+        if modes.iter().zip(&failed).all(|(m, f)| m.is_some() || f.is_some()) || std::time::Instant::now() >= deadline { break; }
         std::thread::sleep(poll);
     }
     let list: Vec<Value> = parsed.iter().zip(&modes).map(|((id, m, ..), mode)| json!({"id": id, "machine": m, "mode": mode})).collect();
     if modes.iter().all(Option::is_some) {
         return ToolResult::ok(format!("ZooKeeper ensemble is running at {ensemble}."), Some(json!({"ensemble": ensemble, "nodes": list})));
     }
-    let stuck: Vec<String> = parsed.iter().zip(&modes).filter(|(_, m)| m.is_none()).map(|(p, _)| format!("{} on `{}`", p.0, p.1)).collect();
-    let mut res = ToolResult::err(format!(
-        "ZooKeeper node(s) {} did not start serving within {} s. The processes were started but have no mode, which usually means the \
+    let stuck: Vec<String> = parsed.iter().enumerate().filter(|(i, _)| modes[*i].is_none() && failed[*i].is_none()).map(|(_, p)| format!("{} on `{}`", p.0, p.1)).collect();
+    let unreachable: Vec<String> = parsed.iter().enumerate().filter_map(|(i, p)| failed[i].as_ref().map(|e| format!("node {} on `{}`: machine unreachable: {e}", p.0, p.1))).collect();
+    let mut text = String::new();
+    if !unreachable.is_empty() { text.push_str(&format!("Could not check {}.\n", unreachable.join("; "))); }
+    if !stuck.is_empty() {
+        text.push_str(&format!(
+            "ZooKeeper node(s) {} did not start serving within {} s. The processes were started but have no mode, which usually means the \
 peer/election ports between the machines are blocked (firewall or security group): open the peer and election ports between all machines, \
-or check each node's log under ~/.arcus-cli/zk/node<id>/zookeeper.log. Nodes that already serve: {}.",
-        stuck.join(", "), wait.as_secs(),
+or check each node's log under ~/.arcus-cli/zk/node<id>/zookeeper.log. ", stuck.join(", "), wait.as_secs()));
+    }
+    text.push_str(&format!("Nodes that already serve: {}.",
         parsed.iter().zip(&modes).filter_map(|(p, m)| m.as_ref().map(|m| format!("{} ({m})", p.0))).collect::<Vec<_>>().join(", ")));
+    let mut res = ToolResult::err(text);
     res.structured = Some(json!({"ensemble": ensemble, "nodes": list}));
     res
 }
@@ -523,6 +553,32 @@ mod tests {
         assert_eq!(st.len(), 3);
         assert_eq!(st[1].1["my_ids"], json!([2]));
         assert_eq!(st[1].1["members"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn cluster_start_reports_unreachable_machine_quickly() {
+        let fwd = |tool: &str, _a: &Value, m: &str| -> ToolResult {
+            if tool == "arcus_zk_start" { return ToolResult::ok("ok", Some(json!({}))); }
+            if m == "c" { return ToolResult::err("authentication failed: run ssh-copy-id"); }
+            ToolResult::ok("m", Some(json!({"mode": "follower"})))
+        };
+        let t = std::time::Instant::now();
+        let r = cluster_zk_start(&start_args(), &fwd, std::time::Duration::from_secs(30), std::time::Duration::from_millis(5));
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
+        assert!(r.is_error && r.text.contains("node 3 on `c`") && r.text.contains("authentication failed"), "{}", r.text);
+        assert!(!r.text.contains("blocked"), "{}", r.text);
+    }
+
+    #[test]
+    fn cluster_start_refuses_existing_different_ensemble() {
+        let fwd = |tool: &str, _a: &Value, m: &str| -> ToolResult {
+            if tool == "arcus_zk_start" && m == "b" {
+                return ToolResult::ok("ok", Some(json!({"already_running": true, "ensemble": "127.0.0.1:2181", "nodes": [{"id": 1}]})));
+            }
+            ToolResult::ok("ok", Some(json!({"mode": "leader"})))
+        };
+        let r = cluster_zk_start(&start_args(), &fwd, std::time::Duration::from_millis(30), std::time::Duration::from_millis(5));
+        assert!(r.is_error && r.text.contains("`b`") && r.text.contains("arcus_zk_stop"), "{}", r.text);
     }
 
     #[test]
