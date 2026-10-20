@@ -107,10 +107,12 @@ args = ["--mcp"]
 | `arcus_list_features` | Optional build features per edition (public / ee) |
 | `arcus_check_prerequisites` | Report missing build tools and the command to install them |
 | `arcus_list_versions` | Installable server versions per edition |
-| `arcus_ee_login` | GitHub device-code login for the private EE sources |
+| `arcus_ee_login` | GitHub device-code login for the private EE sources (`accept_plaintext_token` on Linux without a keyring) |
 | `arcus_install` | Build and install a server from source (background job) |
 | `arcus_job_status` | Poll a background job |
 | `arcus_zk_start` / `arcus_zk_stop` | Start or stop a local ZooKeeper ensemble of 1-7 nodes (downloads it first if needed). `count`, `client_ports`, `peer_ports`, `election_ports` (or `base_*_port`) and `version` are all chosen by the user; the recommended values are 3 nodes on 2181-2183 / 2888-2890 / 3888-3890. The running ensemble is recorded in `zk/ensemble.json`, and `arcus_setup` with `zk: "local"` uses it |
+| `arcus_host_list_ssh_config` / `arcus_host_add` / `arcus_host_list` / `arcus_host_check` / `arcus_host_install` | Register, check and install arcus-cli on remote machines (see Remote machines) |
+| `arcus_cluster_zk_plan` / `arcus_cluster_zk_start` / `arcus_cluster_status` | Multi-machine ZooKeeper ensemble and status overview |
 | `arcus_setup` | Define a server instance and create its znodes; plan only unless `apply=true` |
 | `arcus_start` / `arcus_stop` / `arcus_status` | Run, stop and inspect instances (`arcus_stop` uses SIGTERM; `force` sends SIGKILL) |
 
@@ -121,6 +123,40 @@ a URL; open the URL, enter the code and approve. The token stays in gh's own
 credential store; `arcus-cli` does not save it, and it never passes through the
 AI conversation. Afterwards
 `arcus_list_versions` and `arcus_install` work for `edition: "ee"`.
+
+### Remote machines
+
+The same tools can run on other machines over SSH. Every server, ZooKeeper,
+job and instance tool accepts an optional `machine` argument; the call is
+forwarded to `~/.arcus-cli/bin/arcus-cli --call <tool>` on that machine.
+
+- **ssh config reuse**: `Host` aliases in `~/.ssh/config` (including `Include`d
+  files) are used by alias with no further questions (`arcus_host_list_ssh_config`
+  lists them). Other machines are registered with `arcus_host_add` (`host`, `user`,
+  `port`, optional `identity_file`) in `~/.arcus-cli/hosts.toml`. Passwords are
+  never stored; they come only from the `SSH_ASKPASS` dialog. Without a GUI, run
+  `ssh-copy-id <user>@<host>` once. Connections are shared through `ControlMaster`.
+- **Host keys**: an unknown host key returns its fingerprint; call again with
+  `accept_host_key: true` only after the user agrees. A changed key is never accepted.
+- **Check and install**: `arcus_host_check` reports OS, architecture and the
+  installed agent. `arcus_host_install` first returns a plan, and installs or
+  replaces `arcus-cli` on the machine only when called again to apply it.
+- **Service vs daemon**: in service mode (Linux) the agent runs as a systemd user
+  unit and needs linger (`loginctl enable-linger`). If linger is refused, ask an
+  admin for it or install in daemon mode. sudo is never used. Servers and ZooKeeper
+  nodes keep running if the agent or its supervisor fails.
+- **Cluster ZooKeeper**: `arcus_cluster_zk_plan` proposes one node per machine;
+  after the user confirms, `arcus_cluster_zk_start` starts the ensemble and returns
+  the connect string for `arcus_setup`.
+- **Cluster status**: `arcus_cluster_status` runs `arcus_status` on all registered
+  machines (or the given `machines`) in parallel.
+- **EE login**: on a machine without a keyring, `arcus_ee_login` requires
+  `accept_plaintext_token: true`; gh then keeps the token in
+  `~/.config/gh/hosts.yml` (mode 600).
+
+Known limits: on macOS the exit status of a server is unknown after its
+supervisor dies. Installing from a release needs a release tag matching the
+local binary (`ARCUS_CLI_TAG`); a development build must pass `binary` explicitly.
 
 ### Files
 
