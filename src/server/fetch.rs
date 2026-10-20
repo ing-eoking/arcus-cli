@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256, Sha512};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Expected digest of a downloaded file (lowercase hex).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,17 +48,30 @@ fn safe_url(url: &str) -> &str {
     url.split(['?', '#']).next().unwrap_or(url)
 }
 
-fn agent() -> ureq::Agent {
+/// Connect timeout for every request.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Time allowed for the server to start answering (headers) and to accept the request.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Overall limit for small JSON API calls (they run on the MCP request path).
+const JSON_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// `global` bounds the whole call (JSON API calls); file downloads pass `None` and are
+/// protected only by the connect/response timeouts so large files can finish.
+fn agent(global: Option<Duration>) -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_send_request(Some(RESPONSE_TIMEOUT))
+        .timeout_recv_response(Some(RESPONSE_TIMEOUT))
+        .timeout_global(global)
         .build()
         .into()
 }
 
 /// Sends a GET; returns the response for a 2xx status, otherwise an error
 /// that mentions only the URL path (no headers, no query string).
-fn send(req: &Request) -> io::Result<ureq::http::Response<ureq::Body>> {
-    let mut r = agent().get(&req.url)
+fn send(req: &Request, global: Option<Duration>) -> io::Result<ureq::http::Response<ureq::Body>> {
+    let mut r = agent(global).get(&req.url)
         .header("User-Agent", concat!("arcus-cli/", env!("CARGO_PKG_VERSION")));
     for (k, v) in &req.headers { r = r.header(k.as_str(), v.as_str()); }
     let url = safe_url(&req.url);
@@ -112,7 +126,7 @@ pub fn fetch_cached(req: &Request, dest: &Path, sum: Option<&Checksum>) -> io::R
 }
 
 fn download(req: &Request, part: &Path, sum: Option<&Checksum>) -> io::Result<()> {
-    let resp = send(req)?;
+    let resp = send(req, None)?;
     let mut reader = resp.into_body().into_reader();
     let mut out = fs::File::create(part)?;
     let mut hasher = sum.map(Hasher::new);
@@ -133,7 +147,11 @@ fn download(req: &Request, part: &Path, sum: Option<&Checksum>) -> io::Result<()
 }
 
 pub fn get_json(req: &Request) -> io::Result<Value> {
-    let resp = send(req)?;
+    get_json_within(req, JSON_TIMEOUT)
+}
+
+fn get_json_within(req: &Request, limit: Duration) -> io::Result<Value> {
+    let resp = send(req, Some(limit))?;
     let mut body = String::new();
     resp.into_body().into_reader().read_to_string(&mut body)?;
     serde_json::from_str(&body).map_err(|_| io::Error::new(io::ErrorKind::InvalidData,
@@ -218,6 +236,23 @@ mod tests {
         assert_eq!(fetch_cached(&req(&url), &f, None).unwrap(), f);
         assert_eq!(fs::read_to_string(&f).unwrap(), "abc");
         assert!(!d.join("a.part").exists());
+    }
+
+    #[test]
+    fn get_json_times_out_on_silent_server() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let conn = l.accept();
+            let _ = rx.recv_timeout(Duration::from_secs(5)); // hold the connection open, never answer
+            drop(conn);
+        });
+        let started = std::time::Instant::now();
+        let e = get_json_within(&req(&format!("http://127.0.0.1:{port}/x?token=secret")), Duration::from_millis(300)).unwrap_err();
+        let _ = tx.send(());
+        assert!(started.elapsed() < Duration::from_secs(4), "took {:?}", started.elapsed());
+        assert!(e.to_string().contains("timeout") && !e.to_string().contains("secret"), "{e}");
     }
 
     #[test]
