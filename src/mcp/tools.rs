@@ -326,11 +326,10 @@ impl Tool for EeLogin {
     fn call(&self, ctx: &Ctx, _args: &Value) -> ToolResult {
         use crate::server::jobs::{self, JobKind, JobSpec, JobState};
         // Downloading gh happens synchronously, before the job is submitted.
-        if find_gh(&ctx.home).is_none() {
-            if let Err(e) = release::download_gh(&ctx.home) {
+        if find_gh(&ctx.home).is_none()
+            && let Err(e) = release::download_gh(&ctx.home) {
                 return ToolResult::err(format!("GitHub CLI (gh) is not installed and downloading it failed: {e}"));
             }
-        }
         let id = match jobs::submit(&ctx.home, JobSpec { kind: JobKind::EeLogin, params: json!({}) }) {
             Ok(id) => id,
             Err(e) => return ToolResult::err(format!("failed to start the login job: {e}")),
@@ -623,8 +622,8 @@ fn setup_with(home: &crate::server::home::Home, args: &Value, connect: Connect, 
     };
 
     /* An existing ensemble must already define the ACL group; we never create it there. */
-    if let (Some(store), Some(z), Some(sc)) = (&store, &cfg.zk, &cfg.sasl) {
-        if !z.local {
+    if let (Some(store), Some(z), Some(sc)) = (&store, &cfg.zk, &cfg.sasl)
+        && !z.local {
             let g = format!("/arcus_acl/{}", sc.acl_group);
             match store.get(&g) {
                 Ok(Some(_)) => {}
@@ -632,7 +631,6 @@ fn setup_with(home: &crate::server::home::Home, args: &Value, connect: Connect, 
                 Err(e) => return ToolResult::err(format!("cannot read {g}: {e}")),
             }
         }
-    }
 
     let inst_dir = home.instance(&name);
     let pw_path = inst_dir.join("sasl_password");
@@ -700,9 +698,8 @@ fn setup_with(home: &crate::server::home::Home, args: &Value, connect: Connect, 
         let auth = format!("{node}/authPassword");
         let stored = diffs.iter().any(|(z, a)| z.path == auth
             && (matches!(a, Action::Create) || (matches!(a, Action::Differs { .. }) && overwrite.contains(&auth))));
-        if stored {
-            if let Err(e) = write_secret(&pw_path, pw) { return ToolResult::err(format!("cannot save {}: {e}", pw_path.display())); }
-        }
+        if stored
+            && let Err(e) = write_secret(&pw_path, pw) { return ToolResult::err(format!("cannot save {}: {e}", pw_path.display())); }
     }
     let written = match &store {
         Some(store) => match apply(&**store, &diffs, &overwrite) {
