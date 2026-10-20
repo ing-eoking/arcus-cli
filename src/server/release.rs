@@ -92,7 +92,9 @@ pub fn download_source(rel: &Release, token: Option<&Token>, home: &Home) -> io:
 
 /// The token `<gh> auth token` prints (read-only).
 pub fn gh_token(gh: &Path) -> Option<Token> {
-    let out = Command::new(gh).args(["auth", "token"]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    /* gh prefers GH_TOKEN/GITHUB_TOKEN over its own login; drop them to read the login itself */
+    let out = Command::new(gh).args(["auth", "token"]).env_remove("GH_TOKEN").env_remove("GITHUB_TOKEN")
+        .stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
     if !out.status.success() { return None; }
     let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if t.is_empty() { None } else { Some(Token(t)) }

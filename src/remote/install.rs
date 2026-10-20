@@ -51,7 +51,9 @@ pub fn daemon_command_for(os: &str, bin: &str, home: &str) -> String {
 }
 
 /// Shell test that `$pid` really is an arcus-cli process (a stale pid file may name an unrelated process).
-const AGENT_IS_ARCUS: &str = "ps -p \"$pid\" -o comm= 2>/dev/null | grep -q arcus-cli";
+/// Exact basename match: macOS `ps -o comm=` prints the full path, so a substring
+/// match would also hit java/memcached running under `~/.arcus-cli`.
+const AGENT_IS_ARCUS: &str = "ps -p \"$pid\" -o comm= 2>/dev/null | sed 's#.*/##' | grep -qx arcus-cli";
 
 /// Stops the old agent however it was started (unit, launchd, or daemon); "not present" is fine.
 /// Never touches supervisors or servers.
@@ -67,7 +69,7 @@ if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null && {AGENT_IS_ARCUS}; then kil
 
 /// Exit 0 when the old agent process is gone.
 const AGENT_GONE_CMD: &str = "pid=$(cat \"$HOME/.arcus-cli/agent.pid\" 2>/dev/null); \
-if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null && ps -p \"$pid\" -o comm= 2>/dev/null | grep -q arcus-cli; then exit 1; fi; exit 0";
+if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null && ps -p \"$pid\" -o comm= 2>/dev/null | sed 's#.*/##' | grep -qx arcus-cli; then exit 1; fi; exit 0";
 
 fn plan_steps(os: &str, mode: &str, replace: bool, has_agent: bool) -> Vec<String> {
     let mut s = vec![
@@ -420,8 +422,8 @@ mod tests {
     }
     #[test] fn old_agent_is_killed_only_if_arcus_cli() {
         let c = stop_old_agent("Linux");
-        assert!(c.contains("ps -p \"$pid\" -o comm=") && c.contains("grep -q arcus-cli") && c.contains("kill \"$pid\""));
-        assert!(AGENT_GONE_CMD.contains("grep -q arcus-cli"));
+        assert!(c.contains("ps -p \"$pid\" -o comm=") && c.contains("grep -qx arcus-cli") && c.contains("sed 's#.*/##'") && c.contains("kill \"$pid\""));
+        assert!(AGENT_GONE_CMD.contains("grep -qx arcus-cli"));
     }
     #[test] fn refusal_lists_servers_zk_nodes_and_tag() {
         let (home, cfg, _) = setup("refuse");
