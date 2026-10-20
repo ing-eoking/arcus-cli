@@ -57,6 +57,9 @@ fn forward_with(ctx: &Ctx, tool: &str, args: &Value, machine: &str, runner: &dyn
             if is_missing_binary(status, &stderr) { return missing_binary_hint(machine); }
             return ToolResult::err(format!("remote command failed ({status}): {}", first_lines(stderr.trim())));
         }
+        Err(SshError::HostKeyUnknown { fingerprint }) => return ToolResult::err(format!(
+            "unknown host key for `{machine}` (fingerprint: {fingerprint}). Show this fingerprint to the user; only after the user agrees, \
+call arcus_host_check with machine: \"{machine}\" and accept_host_key: true first, then retry this call")),
         Err(e) => return ssh_error_result(e),
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -174,6 +177,21 @@ mod tests {
         let f = fake(0, &long, "");
         let r = forward_with(&ctx, "zk_ls", &json!({}), "dev-1", &f, &cfg);
         assert!(r.is_error && r.text.contains("line19") && !r.text.contains("line20"), "{}", r.text);
+    }
+
+    #[test]
+    fn forward_unknown_host_key_points_to_host_check() {
+        let (ctx, cfg) = setup("hk");
+        let o = |st: i32, so: &str, se: &str| SshOutput { status: st, stdout: so.as_bytes().to_vec(), stderr: se.into() };
+        let f = Fake { stdin: RefCell::new(vec![]), reply: RefCell::new(vec![
+            o(255, "", "Host key verification failed."),
+            o(0, "hostname 10.0.0.1\nport 22\n", ""),
+            o(0, "10.0.0.1 ssh-ed25519 AAAA\n", ""),
+            o(0, "256 SHA256:abc 10.0.0.1 (ED25519)\n", ""),
+        ]) };
+        let r = forward_with(&ctx, "zk_ls", &json!({}), "dev-1", &f, &cfg);
+        assert!(r.is_error && r.text.contains("arcus_host_check") && r.text.contains("SHA256:abc"), "{}", r.text);
+        assert!(r.text.contains("dev-1"));
     }
 
     #[test]
