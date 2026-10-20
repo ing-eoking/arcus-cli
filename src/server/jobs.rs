@@ -210,7 +210,7 @@ pub fn run_job(home: &Home, id: &str) -> io::Result<()> {
     finish(home, id, outcome)
 }
 
-fn pid_alive(pid: u32) -> bool {
+pub fn pid_alive(pid: u32) -> bool {
     let Ok(p) = libc::pid_t::try_from(pid) else { return false };
     // SAFETY: signal 0 only checks for existence/permission.
     unsafe { libc::kill(p, 0) == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
