@@ -1,6 +1,7 @@
-use super::{arg_bool, arg_opt_str, arg_str, arg_u64, in_call_mode, Ctx, Tool, ToolResult, ToolSpec};
+use super::{arg_bool, arg_opt_str, arg_str, arg_u64, Ctx, Tool, ToolResult, ToolSpec};
 use crate::connect::collect_responses;
 use crate::remote::forward::Remote;
+use crate::remote::ssh::SystemRunner;
 use crate::server::build::{detect_os, install_hint, missing_tools, on_path};
 use crate::server::features::{Edition, Feature};
 use crate::server::release::{self, find_gh, find_tokens};
@@ -25,9 +26,9 @@ pub fn registry() -> Vec<Box<dyn Tool>> {
         Box::new(Remote(ListFeatures)),
         Box::new(Remote(CheckPrerequisites)),
         Box::new(Remote(JobStatusTool)),
-        Box::new(Remote(ListVersions)),
-        Box::new(Remote(EeLogin)),
-        Box::new(Remote(Install)),
+        Box::new(HereOnly(ListVersions)),
+        Box::new(LocalEeLogin),
+        Box::new(RemoteInstall),
         Box::new(Remote(ZkStart)),
         Box::new(Remote(ZkStop)),
         Box::new(Remote(ZkMode)),
@@ -353,73 +354,91 @@ impl Tool for EeLogin {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "arcus_ee_login",
-            description: "Start a GitHub browser (device) login to get access to the private EE sources. Returns a one-time \
+            description: "Start a GitHub browser (device) login on this computer to get access to the private EE sources. Returns a one-time \
                 code and URL; show both to the user, who approves in a browser. No token passes through this conversation. \
-                On a Linux machine without a keyring, gh would store the token in plain text, so ask the user first and pass accept_plaintext_token: true.",
-            input_schema: json!({"type": "object", "properties": {
-                "accept_plaintext_token": {"type": "boolean", "description": "Allow gh to store the token in ~/.config/gh/hosts.yml (mode 600) when there is no keyring (default false)"}
-            }}),
+                Only this computer logs in: for other machines the EE source is downloaded here and copied to them. \
+                On Linux without a keyring the login is kept only in a temporary directory and removed after the next EE download.",
+            input_schema: json!({"type": "object", "properties": {}}),
         }
     }
-    fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
+    fn call(&self, ctx: &Ctx, _args: &Value) -> ToolResult {
         use crate::server::jobs::{self, JobKind, JobSpec};
-        let remote = in_call_mode() || std::env::var_os("SSH_CONNECTION").is_some_and(|v| !v.is_empty());
-        let keyring = std::env::consts::OS == "linux" && secret_service_available();
-        if plaintext_consent_needed(std::env::consts::OS, keyring, remote, arg_bool(args, "accept_plaintext_token", false)) {
-            return plaintext_consent_error();
-        }
+        use crate::server::release::GhConfig;
+        let (params, note) = match release::current_gh_config() {
+            Ok(GhConfig::Normal) => (json!({}), ""),
+            Ok(GhConfig::Ephemeral(dir)) => {
+                if let Err(e) = release::create_private_dir(&dir) {
+                    return ToolResult::err(format!("cannot create the temporary gh config directory {}: {e}", dir.display()));
+                }
+                (json!({"gh_config_dir": dir.display().to_string()}), TEMP_LOGIN_NOTE)
+            }
+            Err(e) => return ToolResult::err(e),
+        };
         // The job downloads gh itself when it is missing, so this call never blocks on that download.
-        let id = match jobs::submit(&ctx.home, JobSpec { kind: JobKind::EeLogin, params: json!({}) }) {
+        let id = match jobs::submit(&ctx.home, JobSpec { kind: JobKind::EeLogin, params }) {
             Ok(id) => id,
             Err(e) => return ToolResult::err(format!("failed to start the login job: {e}")),
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             if let Ok(s) = jobs::status(&ctx.home, &id)
-                && let Some(r) = login_reply(&id, &s, false) { return r; }
+                && let Some(r) = login_reply(&id, &s, false, note) { return r; }
             if std::time::Instant::now() >= deadline { break; }
             std::thread::sleep(Duration::from_millis(250));
         }
         match jobs::status(&ctx.home, &id) {
-            Ok(s) => login_reply(&id, &s, true).unwrap_or_else(|| ToolResult::err(format!("login job {id}: no status"))),
+            Ok(s) => login_reply(&id, &s, true, note).unwrap_or_else(|| ToolResult::err(format!("login job {id}: no status"))),
             Err(e) => ToolResult::err(format!("login job {id}: {e}")),
         }
     }
 }
 
-/// True on Linux when gh would store the token in plain text and the user has not consented.
-/// `keyring` means a real Secret Service owner exists (a mere D-Bus session address is not enough: pam_systemd sets it over SSH);
-/// `remote` (SSH or `--call`) always requires consent because nobody can see a keyring prompt there.
-fn plaintext_consent_needed(os: &str, keyring: bool, remote: bool, accepted: bool) -> bool {
-    os == "linux" && (remote || !keyring) && !accepted
-}
+const TEMP_LOGIN_NOTE: &str = " Also tell the user: this computer has no keyring, so the login is temporary (kept in $XDG_RUNTIME_DIR, never on disk) \
+    and is removed after the next EE download; it will be asked again next time.";
 
-/// Whether `org.freedesktop.secrets` has an owner on the session bus.
-fn secret_service_available() -> bool {
-    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none_or(|v| v.is_empty()) { return false; }
-    let run = |cmd: &str, args: &[&str]| std::process::Command::new(cmd).args(args)
-        .stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok();
-    if let Some(o) = run("dbus-send", &["--session", "--print-reply", "--dest=org.freedesktop.DBus", "/org/freedesktop/DBus",
-        "org.freedesktop.DBus.NameHasOwner", "string:org.freedesktop.secrets"]) {
-        return o.status.success() && String::from_utf8_lossy(&o.stdout).contains("boolean true");
+const REMOTE_LOGIN_ERROR: &str = "Remote machines need no GitHub login: the EE source is downloaded by this computer and copied to them \
+    when arcus_install runs with `machine`. Nothing was done. If this computer has no EE access yet, call arcus_ee_login without `machine`.";
+
+/// `arcus_ee_login` with a `machine` argument is refused: only this computer logs in.
+struct LocalEeLogin;
+impl Tool for LocalEeLogin {
+    fn spec(&self) -> ToolSpec {
+        let mut s = EeLogin.spec();
+        s.input_schema["properties"]["machine"] = json!({"type": "string",
+            "description": "Not supported: remote machines never log in (the EE source is relayed from this computer); omit it"});
+        s
     }
-    run("busctl", &["--user", "status", "org.freedesktop.secrets"]).is_some_and(|o| o.status.success())
+    fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
+        if arg_opt_str(args, "machine").is_some() { return ToolResult::err(REMOTE_LOGIN_ERROR); }
+        EeLogin.call(ctx, args)
+    }
 }
 
-fn plaintext_consent_error() -> ToolResult {
-    ToolResult::err("this machine has no keyring, so gh will store the GitHub token in plain text in ~/.config/gh/hosts.yml (mode 600). \
-Ask the user whether that is acceptable; only if they agree, call arcus_ee_login again with accept_plaintext_token: true.")
+/// A tool whose result is the same on every machine: accepts `machine` but always runs on this computer.
+struct HereOnly<T: Tool>(T);
+impl<T: Tool> Tool for HereOnly<T> {
+    fn spec(&self) -> ToolSpec {
+        let mut s = self.0.spec();
+        s.input_schema["properties"]["machine"] = json!({"type": "string",
+            "description": "Ignored: the answer is the same on every machine and is computed on this computer"});
+        s
+    }
+    fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
+        let mut rest = args.clone();
+        if let Some(o) = rest.as_object_mut() { o.remove("machine"); }
+        self.0.call(ctx, &rest)
+    }
 }
 
 /// Reply for the login job's current status: the code once published, a failure, or (`timed_out`) a poll instruction.
 /// `None` while the job is still running and there is nothing to report yet.
-fn login_reply(id: &str, s: &crate::server::jobs::JobStatus, timed_out: bool) -> Option<ToolResult> {
+fn login_reply(id: &str, s: &crate::server::jobs::JobStatus, timed_out: bool, note: &str) -> Option<ToolResult> {
     use crate::server::jobs::JobState;
     if let Some(code) = s.result.as_ref().and_then(|r| r["code"].as_str()) {
         let url = s.result.as_ref().and_then(|r| r["url"].as_str()).unwrap_or(release::DEVICE_URL);
         return Some(ToolResult::ok(
             format!("Show this to the user: open {url} and enter the one-time code {code}. \
-                Then poll arcus_job_status with id {id} until it is succeeded."),
+                Then poll arcus_job_status with id {id} until it is succeeded.{note}"),
             Some(json!({"job_id": id, "code": code, "url": url}))));
     }
     if s.state != JobState::Running {
@@ -441,7 +460,8 @@ impl Tool for Install {
             name: "arcus_install",
             description: "Build and install an ARCUS server from source as a background job. Returns job_id and build_key; \
                 poll arcus_job_status until it is succeeded (the build can take several minutes). Missing build tools are \
-                reported with an install command to show the user. EE needs a GitHub login (arcus_ee_login). Arguments with recommended values (version): \
+                reported with an install command to show the user. EE needs a GitHub login on this computer (arcus_ee_login); \
+                with `machine`, the EE source is downloaded here and copied to that machine, which needs no login. Arguments with recommended values (version): \
                 propose them to the user and confirm before calling.",
             input_schema: json!({
                 "type": "object",
@@ -449,71 +469,120 @@ impl Tool for Install {
                     "edition": {"type": "string", "enum": ["public", "ee"], "description": "ARCUS edition"},
                     "version": {"type": "string", "description": "Version to build (recommended: the newest; see arcus_list_versions)"},
                     "features": {"type": "array", "items": {"type": "string"},
-                        "description": "Feature names from arcus_list_features"}
+                        "description": "Feature names from arcus_list_features"},
+                    "source_file": {"type": "string",
+                        "description": "Source tarball already on this machine (set automatically when installing on another machine); needs version"}
                 },
                 "required": ["edition", "features"]
             }),
         }
     }
     fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
-        use crate::server::features::{build_key, validate};
+        use crate::server::features::build_key;
         use crate::server::jobs::{self, JobKind, JobSpec};
-        use std::collections::BTreeSet;
-        let edition = match try_arg!(arg_str(args, "edition")).as_str() {
-            "public" => Edition::Public,
-            "ee" => Edition::Ee,
-            other => return ToolResult::err(format!("invalid edition '{other}': use \"public\" or \"ee\"")),
-        };
-        let mut features = BTreeSet::new();
-        for v in args.get("features").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]) {
-            match serde_json::from_value::<Feature>(v.clone()) {
-                Ok(f) => { features.insert(f); }
-                Err(_) => return ToolResult::err(format!("unknown feature {v}; see arcus_list_features")),
-            }
+        let (edition, features) = try_arg!(install_edition_features(args));
+        let source = arg_opt_str(args, "source_file").map(|s| expand_home(&s));
+        if let Some(src) = &source {
+            if arg_opt_str(args, "version").is_none() { return ToolResult::err("source_file needs `version` (the version of that tarball)"); }
+            if !src.is_file() { return ToolResult::err(format!("source_file {} does not exist", src.display())); }
         }
-        if let Err(e) = validate(edition, &features) { return ToolResult::err(e); }
         let missing = missing_tools(&on_path);
         if !missing.is_empty() {
             return ToolResult::err(format!("Missing build tools: {}\nAsk the user to run: {}",
                 missing.join(", "), install_hint(detect_os(), &missing)));
         }
-        let releases = if edition == Edition::Ee {
-            let tokens = find_tokens(find_gh(&ctx.home).as_deref());
-            if tokens.is_empty() {
-                return ToolResult::err(format!("No GitHub token found for the EE edition. {NO_LOGIN_HINT}"));
-            }
-            match release::list_ee_releases(&tokens) {
-                Ok((l, _)) => l,
-                Err(e) => return ToolResult::err(release::ee_failure("arcus_install failed to list versions", &e)),
-            }
-        } else {
-            match release::list_releases(edition, None) {
-                Ok(l) => l,
-                Err(e) => return ToolResult::err(format!("arcus_install failed to list versions: {e}")),
+        let version = match (&source, arg_opt_str(args, "version")) {
+            (Some(_), Some(v)) => v,
+            _ => {
+                let releases = if edition == Edition::Ee {
+                    let tokens = find_tokens(find_gh(&ctx.home).as_deref());
+                    if tokens.is_empty() {
+                        return ToolResult::err(format!("No GitHub token found for the EE edition. {NO_LOGIN_HINT}"));
+                    }
+                    match release::list_ee_releases(&tokens) {
+                        Ok((l, _)) => l,
+                        Err(e) => return ToolResult::err(release::ee_failure("arcus_install failed to list versions", &e)),
+                    }
+                } else {
+                    match release::list_releases(edition, None) {
+                        Ok(l) => l,
+                        Err(e) => return ToolResult::err(format!("arcus_install failed to list versions: {e}")),
+                    }
+                };
+                let version = match arg_opt_str(args, "version") {
+                    Some(v) => v,
+                    None => match releases.first() {
+                        Some(r) => r.version.clone(),
+                        None => return ToolResult::err("no releases found"),
+                    },
+                };
+                if !releases.iter().any(|r| r.version == version) {
+                    return ToolResult::err(format!("version {version} not found; see arcus_list_versions"));
+                }
+                version
             }
         };
-        let version = match arg_opt_str(args, "version") {
-            Some(v) => v,
-            None => match releases.first() {
-                Some(r) => r.version.clone(),
-                None => return ToolResult::err("no releases found"),
-            },
-        };
-        if !releases.iter().any(|r| r.version == version) {
-            return ToolResult::err(format!("version {version} not found; see arcus_list_versions"));
-        }
         let key = build_key(edition, &version, &features);
-        let params = json!({
+        let mut params = json!({
             "edition": if edition == Edition::Ee { "ee" } else { "public" },
             "version": version,
             "features": features,
             "build_key": key,
         });
+        if let Some(src) = &source { params["source_file"] = json!(src.display().to_string()); }
+        let temporary = edition == Edition::Ee && source.is_none() && release::ephemeral_gh_dir().is_some();
         match jobs::submit(&ctx.home, JobSpec { kind: JobKind::Install, params }) {
             Ok(id) => ToolResult::ok(
-                format!("Started build {key} as job {id}. Poll arcus_job_status with this id until it is succeeded."),
+                format!("Started build {key} as job {id}. Poll arcus_job_status with this id until it is succeeded.{}",
+                    if temporary { " Tell the user: the GitHub login on this computer is temporary (no keyring) and is removed \
+                        once this download finishes; the next EE install will ask for arcus_ee_login again." } else { "" }),
                 Some(json!({"job_id": id, "build_key": key}))),
             Err(e) => ToolResult::err(format!("failed to start the install job: {e}")),
+        }
+    }
+}
+
+/// `~/x` → `$HOME/x` (the relay passes the remote path this way).
+fn expand_home(p: &str) -> std::path::PathBuf {
+    match (p.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(h)) => std::path::PathBuf::from(h).join(rest),
+        _ => std::path::PathBuf::from(p),
+    }
+}
+
+/// `edition` and validated `features` of `arcus_install`.
+fn install_edition_features(args: &Value) -> Result<(Edition, std::collections::BTreeSet<Feature>), ToolResult> {
+    let edition = match arg_str(args, "edition")?.as_str() {
+        "public" => Edition::Public,
+        "ee" => Edition::Ee,
+        other => return Err(ToolResult::err(format!("invalid edition '{other}': use \"public\" or \"ee\""))),
+    };
+    let mut features = std::collections::BTreeSet::new();
+    for v in args.get("features").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]) {
+        match serde_json::from_value::<Feature>(v.clone()) {
+            Ok(f) => { features.insert(f); }
+            Err(_) => return Err(ToolResult::err(format!("unknown feature {v}; see arcus_list_features"))),
+        }
+    }
+    crate::server::features::validate(edition, &features).map_err(ToolResult::err)?;
+    Ok((edition, features))
+}
+
+/// `arcus_install` with `machine`: the EE source is fetched here and relayed (see `remote::relay`);
+/// everything else is forwarded unchanged.
+struct RemoteInstall;
+impl Tool for RemoteInstall {
+    fn spec(&self) -> ToolSpec { Remote(Install).spec() }
+    fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
+        let machine = arg_opt_str(args, "machine");
+        match (machine, args.get("edition").and_then(Value::as_str)) {
+            (Some(machine), Some("ee")) => {
+                if let Err(r) = install_edition_features(args) { return r; }
+                let mut rest = args.clone();
+                if let Some(o) = rest.as_object_mut() { o.remove("machine"); o.remove("source_file"); }
+                crate::remote::relay::relay_ee_install(ctx, &rest, &machine, &SystemRunner, &crate::remote::relay::fetch_ee)
+            }
+            _ => Remote(Install).call(ctx, args),
         }
     }
 }
@@ -1114,19 +1183,40 @@ mod tests {
     }
 
     #[test]
-    fn ee_login_requires_plaintext_consent_without_keyring() {
-        // (os, keyring, remote, accepted)
-        assert!(plaintext_consent_needed("linux", false, false, false));
-        assert!(!plaintext_consent_needed("linux", false, false, true));
-        assert!(!plaintext_consent_needed("linux", true, false, false));
-        // DBUS address set but no Secret Service owner => keyring=false => consent still needed
-        assert!(plaintext_consent_needed("linux", false, false, false));
-        // SSH / --call always requires consent, even with a keyring
-        assert!(plaintext_consent_needed("linux", true, true, false));
-        assert!(!plaintext_consent_needed("linux", true, true, true));
-        assert!(!plaintext_consent_needed("macos", false, true, false));
-        let r = plaintext_consent_error();
-        assert!(r.is_error && r.text.contains("hosts.yml") && r.text.contains("accept_plaintext_token"), "{}", r.text);
+    fn ee_login_with_machine_explains_relay_without_ssh() {
+        let t = registry().into_iter().find(|t| t.spec().name == "arcus_ee_login").unwrap();
+        // `dev-x` is not a known machine: any ssh/resolve attempt would answer "unknown machine"
+        let r = t.call(&ctx(), &json!({"machine": "dev-x"}));
+        assert!(r.is_error && r.text.contains("copied to them") && r.text.contains("without `machine`"), "{}", r.text);
+        assert!(!t.spec().input_schema["properties"].as_object().unwrap().contains_key("accept_plaintext_token"));
+    }
+
+    #[test]
+    fn list_versions_with_machine_runs_here() {
+        struct Echo;
+        impl Tool for Echo {
+            fn spec(&self) -> ToolSpec { ToolSpec { name: "echo", description: "e", input_schema: json!({"type": "object", "properties": {}}) } }
+            fn call(&self, _c: &Ctx, a: &Value) -> ToolResult { ToolResult::ok("here", Some(a.clone())) }
+        }
+        let r = HereOnly(Echo).call(&ctx(), &json!({"machine": "dev-x", "edition": "ee"}));
+        assert_eq!((r.text.as_str(), r.structured.unwrap()), ("here", json!({"edition": "ee"})));
+        // the registered tool is the local one: an unknown machine is not even resolved (no ssh)
+        let t = registry().into_iter().find(|t| t.spec().name == "arcus_list_versions").unwrap();
+        let r = t.call(&ctx(), &json!({"machine": "dev-x", "edition": "bogus"}));
+        assert!(r.is_error && r.text.contains("invalid edition"), "{}", r.text);
+    }
+
+    #[test]
+    fn install_source_file_needs_version_and_file() {
+        let t = registry().into_iter().find(|t| t.spec().name == "arcus_install").unwrap();
+        let c = ctx();
+        let r = t.call(&c, &json!({"edition": "ee", "features": [], "source_file": "/nonexistent/x.tar.gz"}));
+        assert!(r.is_error && r.text.contains("needs `version`"), "{}", r.text);
+        let r = t.call(&c, &json!({"edition": "ee", "features": [], "version": "0.12.1", "source_file": "~/nonexistent-arcus/x.tar.gz"}));
+        assert!(r.is_error && r.text.contains("does not exist") && !r.text.contains('~'), "{}", r.text);
+        // remote ee install validates features before any download or ssh
+        let r = t.call(&c, &json!({"machine": "dev-x", "edition": "ee", "features": ["bogus"]}));
+        assert!(r.is_error && r.text.contains("unknown feature"), "{}", r.text);
     }
 
     #[test]
@@ -1134,17 +1224,17 @@ mod tests {
         use crate::server::jobs::JobState::*;
         // still downloading gh: nothing yet, then a poll instruction on timeout
         let s = job_status(Running, "download gh", None);
-        assert!(login_reply("j", &s, false).is_none());
-        let r = login_reply("j", &s, true).unwrap();
+        assert!(login_reply("j", &s, false, "").is_none());
+        let r = login_reply("j", &s, true, "").unwrap();
         assert!(!r.is_error && r.text.contains("arcus_job_status") && r.text.contains("download gh"), "{}", r.text);
         assert_eq!(r.structured.unwrap()["job_id"], "j");
         // code published
         let s = job_status(Running, "waiting for browser approval", Some(json!({"code": "ABCD-1234", "url": "https://github.com/login/device"})));
-        let r = login_reply("j", &s, false).unwrap();
+        let r = login_reply("j", &s, false, "").unwrap();
         assert!(!r.is_error && r.text.contains("ABCD-1234"), "{}", r.text);
         assert_eq!(r.structured.unwrap()["code"], "ABCD-1234");
         // failure
-        let r = login_reply("j", &job_status(Failed, "download gh", None), false).unwrap();
+        let r = login_reply("j", &job_status(Failed, "download gh", None), false, "").unwrap();
         assert!(r.is_error && r.text.contains("boom"), "{}", r.text);
     }
 

@@ -25,7 +25,7 @@ Ask the user to verify the host key by running `ssh {label}` once in a terminal,
     }
 }
 
-fn ssh_config_path() -> PathBuf {
+pub(crate) fn ssh_config_path() -> PathBuf {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".ssh/config")).unwrap_or_else(|| PathBuf::from(".ssh/config"))
 }
 
@@ -42,11 +42,18 @@ fn is_missing_binary(status: i32, text: &str) -> bool {
     status == 127 || text.contains("No such file") || text.contains("not found")
 }
 
+/// An unknown host key met while running a tool on `machine`: accept it through arcus_host_check first.
+pub(crate) fn unknown_host_key(machine: &str, fingerprint: &str) -> ToolResult {
+    ToolResult::err(format!(
+        "unknown host key for `{machine}` (fingerprint: {fingerprint}). Show this fingerprint to the user; only after the user agrees, \
+call arcus_host_check with machine: \"{machine}\" and accept_host_key: true first, then retry this call"))
+}
+
 pub fn forward(ctx: &Ctx, tool: &str, args: &Value, machine: &str, runner: &dyn Runner) -> ToolResult {
     forward_with(ctx, tool, args, machine, runner, &ssh_config_path())
 }
 
-fn forward_with(ctx: &Ctx, tool: &str, args: &Value, machine: &str, runner: &dyn Runner, config: &std::path::Path) -> ToolResult {
+pub(crate) fn forward_with(ctx: &Ctx, tool: &str, args: &Value, machine: &str, runner: &dyn Runner, config: &std::path::Path) -> ToolResult {
     if !tool.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return ToolResult::err(format!("invalid tool name `{tool}`"));
     }
@@ -60,9 +67,7 @@ fn forward_with(ctx: &Ctx, tool: &str, args: &Value, machine: &str, runner: &dyn
             if is_missing_binary(status, &stderr) { return missing_binary_hint(machine); }
             return ToolResult::err(format!("remote command failed ({status}): {}", first_lines(stderr.trim())));
         }
-        Err(SshError::HostKeyUnknown { fingerprint }) => return ToolResult::err(format!(
-            "unknown host key for `{machine}` (fingerprint: {fingerprint}). Show this fingerprint to the user; only after the user agrees, \
-call arcus_host_check with machine: \"{machine}\" and accept_host_key: true first, then retry this call")),
+        Err(SshError::HostKeyUnknown { fingerprint }) => return unknown_host_key(machine, &fingerprint),
         Err(e) => return ssh_error_result(e),
     };
     let stdout = String::from_utf8_lossy(&out.stdout);

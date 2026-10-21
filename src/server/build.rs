@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use super::features::{configure_args, Feature};
 use super::features::Edition;
 use super::jobs::{tail, JobCtx};
-use super::release::{download_source, ee_failure, find_gh, find_tokens, list_ee_releases, list_releases};
+use super::release::fetch_source;
 use serde_json::{json, Value};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -157,30 +157,32 @@ fn parse_edition(s: &str) -> Result<Edition, String> {
     }
 }
 
-/// Job handler for `JobKind::Install`. Params: `{edition, version, features: [..], build_key}`.
-/// The token is looked up here, never stored in params.
+/// Job handler for `JobKind::Install`. Params: `{edition, version, features: [..], build_key, source_file?}`.
+/// The token is looked up here, never stored in params. With `source_file` (a tarball already on this
+/// machine, e.g. relayed by the controller) nothing is listed or downloaded.
 pub fn install_job(ctx: &JobCtx, params: &Value) -> Result<Value, String> {
+    install_job_with(ctx, params, &|e, v| fetch_source(&ctx.home, e, Some(v)).map(|(_, p)| p), &mut RealRunner)
+}
+
+/// Downloads the source of `(edition, version)` and returns the local tarball.
+type FetchFn<'a> = &'a dyn Fn(Edition, &str) -> Result<PathBuf, String>;
+
+fn install_job_with(ctx: &JobCtx, params: &Value, fetch: FetchFn, runner: &mut dyn Runner) -> Result<Value, String> {
     let edition = parse_edition(params["edition"].as_str().unwrap_or(""))?;
     let version = params["version"].as_str().ok_or("missing version")?.to_string();
     let key = params["build_key"].as_str().ok_or("missing build_key")?.to_string();
     let features: BTreeSet<Feature> = serde_json::from_value(params["features"].clone()).map_err(|e| e.to_string())?;
-    let tokens = if edition == Edition::Ee { find_tokens(find_gh(&ctx.home).as_deref()) } else { Vec::new() };
-    if edition == Edition::Ee && tokens.is_empty() {
-        return Err("no GitHub token found; call arcus_ee_login first".into());
+    let source = params["source_file"].as_str().filter(|s| !s.is_empty()).map(PathBuf::from);
+    if let Some(src) = &source && !src.is_file() {
+        return Err(format!("source_file {} does not exist", src.display()));
     }
     let prefix = ctx.home.build_prefix(&key);
     if !is_built(&prefix) {
-        ctx.step("download");
-        let (releases, token) = if edition == Edition::Ee {
-            let (r, t) = list_ee_releases(&tokens).map_err(|e| ee_failure("failed to list EE releases", &e))?;
-            (r, Some(t))
-        } else {
-            (list_releases(edition, None).map_err(|e| e.to_string())?, None)
+        let tarball = match source {
+            Some(src) => src,
+            None => { ctx.step("download"); fetch(edition, &version)? }
         };
-        let rel = releases.into_iter().find(|r| r.version == version)
-            .ok_or_else(|| format!("version {version} not found"))?;
-        let tarball = download_source(&rel, token.as_ref(), &ctx.home).map_err(|e| ee_failure("download failed", &e))?;
-        build(&tarball, &prefix, &features, &ctx.log, &mut RealRunner, &|s| ctx.step(s)).map_err(|e| e.to_string())?;
+        build(&tarball, &prefix, &features, &ctx.log, runner, &|s| ctx.step(s)).map_err(|e| e.to_string())?;
     }
     Ok(json!({"build_key": key, "prefix": prefix.display().to_string()}))
 }
@@ -310,6 +312,32 @@ mod tests {
         if !ok { eprintln!("{r:?}\n{}", tail(&log, 40).unwrap_or_default()); }
         let _ = std::fs::remove_dir_all(&root);
         assert!(ok);
+    }
+
+    #[test]
+    fn source_file_skips_listing_and_download() {
+        let d = tmp("srcfile");
+        let tarball = tiny_tarball(&d);
+        let home = Home::new(Some(d.join("home"))).unwrap();
+        let ctx = JobCtx { id: "install-x".into(), home: home.clone(), log: d.join("job.log") };
+        let fetched = std::cell::Cell::new(false);
+        let fetch = |_: Edition, _: &str| -> Result<PathBuf, String> { fetched.set(true); Err("no GitHub token".into()) };
+        let mut r = Rec { calls: vec![], envs: vec![], fail_on: None };
+        let p = json!({"edition": "ee", "version": "0.12.1", "features": [], "build_key": "ee-0.12.1",
+            "source_file": tarball.display().to_string()});
+        let out = install_job_with(&ctx, &p, &fetch, &mut r).unwrap();
+        assert!(!fetched.get() && r.calls.len() == 4 && is_built(&home.build_prefix("ee-0.12.1")), "{out}");
+        // a missing source file fails before anything else
+        let mut p2 = p.clone();
+        p2["source_file"] = json!(d.join("nope.tar.gz").display().to_string());
+        p2["build_key"] = json!("ee-0.12.1-b");
+        let e = install_job_with(&ctx, &p2, &fetch, &mut r).unwrap_err();
+        assert!(e.contains("does not exist") && !fetched.get(), "{e}");
+        // without source_file the fetch is used (and its error reported)
+        p2.as_object_mut().unwrap().remove("source_file");
+        let e = install_job_with(&ctx, &p2, &fetch, &mut r).unwrap_err();
+        assert!(fetched.get() && e.contains("token"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

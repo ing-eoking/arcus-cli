@@ -90,11 +90,83 @@ pub fn download_source(rel: &Release, token: Option<&Token>, home: &Home) -> io:
     fetch_cached(&req, &home.downloads().join(&rel.asset_name), sum.as_ref())
 }
 
-/// The token `<gh> auth token` prints (read-only).
-pub fn gh_token(gh: &Path) -> Option<Token> {
+/// Where gh keeps its login on this computer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GhConfig {
+    /// gh's own config (macOS keychain, or a Linux keyring).
+    Normal,
+    /// Linux without a keyring: a temporary `GH_CONFIG_DIR` on the tmpfs `$XDG_RUNTIME_DIR`, removed after the download.
+    Ephemeral(PathBuf),
+}
+
+/// Name of the temporary gh config directory under `$XDG_RUNTIME_DIR`.
+pub const EPHEMERAL_GH_DIR: &str = "arcus-cli-gh";
+
+/// Chooses where a new gh login goes. Without a keyring on Linux the login never goes to disk:
+/// it needs `$XDG_RUNTIME_DIR` (tmpfs), otherwise this is an error.
+pub fn select_gh_config(os: &str, keyring: bool, runtime_dir: Option<&Path>) -> Result<GhConfig, String> {
+    if os != "linux" || keyring { return Ok(GhConfig::Normal); }
+    match runtime_dir.filter(|d| d.is_dir()) {
+        Some(d) => Ok(GhConfig::Ephemeral(d.join(EPHEMERAL_GH_DIR))),
+        None => Err("this computer has no keyring (Secret Service) and XDG_RUNTIME_DIR is not set, so the GitHub login \
+            could only be stored on disk, which arcus-cli does not allow. Ask the user to run the MCP client in a desktop session \
+            with a keyring, or in a login session that provides XDG_RUNTIME_DIR, or to set GITHUB_TOKEN in the MCP server env.".into()),
+    }
+}
+
+/// `select_gh_config` for this process (Linux keyring detected through the Secret Service).
+pub fn current_gh_config() -> Result<GhConfig, String> {
+    let os = std::env::consts::OS;
+    let keyring = os == "linux" && secret_service_available();
+    let rt = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()).map(PathBuf::from);
+    select_gh_config(os, keyring, rt.as_deref())
+}
+
+/// Whether `org.freedesktop.secrets` has an owner on the session bus (a mere D-Bus session address is not enough:
+/// pam_systemd sets it over SSH).
+pub fn secret_service_available() -> bool {
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none_or(|v| v.is_empty()) { return false; }
+    let run = |cmd: &str, args: &[&str]| Command::new(cmd).args(args)
+        .stdin(Stdio::null()).stderr(Stdio::null()).output().ok();
+    if let Some(o) = run("dbus-send", &["--session", "--print-reply", "--dest=org.freedesktop.DBus", "/org/freedesktop/DBus",
+        "org.freedesktop.DBus.NameHasOwner", "string:org.freedesktop.secrets"]) {
+        return o.status.success() && String::from_utf8_lossy(&o.stdout).contains("boolean true");
+    }
+    run("busctl", &["--user", "status", "org.freedesktop.secrets"]).is_some_and(|o| o.status.success())
+}
+
+/// The temporary gh config directory when it exists (a login made without a keyring).
+pub fn ephemeral_gh_dir() -> Option<PathBuf> {
+    let rt = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty())?;
+    let d = PathBuf::from(rt).join(EPHEMERAL_GH_DIR);
+    d.is_dir().then_some(d)
+}
+
+/// Creates the temporary gh config directory with mode 700.
+pub fn create_private_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Ends a temporary login: `gh auth logout` in that config dir, then removes the dir. No-op without one.
+pub fn end_ephemeral_login(gh: Option<&Path>) {
+    let Some(dir) = ephemeral_gh_dir() else { return };
+    if let Some(gh) = gh {
+        let _ = Command::new(gh).args(["auth", "logout", "--hostname", "github.com"])
+            .env("GH_CONFIG_DIR", &dir).env_remove("GH_TOKEN").env_remove("GITHUB_TOKEN")
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The token `<gh> auth token` prints (read-only); `config_dir` is a `GH_CONFIG_DIR` to read instead of gh's default.
+pub fn gh_token(gh: &Path, config_dir: Option<&Path>) -> Option<Token> {
     /* gh prefers GH_TOKEN/GITHUB_TOKEN over its own login; drop them to read the login itself */
-    let out = Command::new(gh).args(["auth", "token"]).env_remove("GH_TOKEN").env_remove("GITHUB_TOKEN")
-        .stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    let mut cmd = Command::new(gh);
+    cmd.args(["auth", "token"]).env_remove("GH_TOKEN").env_remove("GITHUB_TOKEN");
+    if let Some(d) = config_dir { cmd.env("GH_CONFIG_DIR", d); }
+    let out = cmd.stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
     if !out.status.success() { return None; }
     let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if t.is_empty() { None } else { Some(Token(t)) }
@@ -111,9 +183,42 @@ pub fn candidate_tokens(env: Option<Token>, gh: Option<Token>) -> Vec<Token> {
     v
 }
 
-/// All usable tokens: `GITHUB_TOKEN`, then `<gh> auth token`.
+/// All usable tokens: `GITHUB_TOKEN`, then `<gh> auth token` (from the temporary gh config dir when it exists).
 pub fn find_tokens(gh: Option<&Path>) -> Vec<Token> {
-    candidate_tokens(env_token(), gh.and_then(gh_token))
+    let dir = ephemeral_gh_dir();
+    candidate_tokens(env_token(), gh.and_then(|g| gh_token(g, dir.as_deref())))
+}
+
+/// Error when no token exists for the EE edition.
+pub const NO_TOKEN: &str = "no GitHub token found on this computer for the EE edition; call arcus_ee_login (without `machine`), \
+    show the code and URL to the user, then retry";
+
+/// Resolves `version` (default: the newest) and downloads its source tarball into `downloads/` (cached).
+/// For EE the token is looked up here and never leaves this function; a temporary gh login (no keyring)
+/// is logged out and removed once the download has finished or failed.
+pub fn fetch_source(home: &Home, edition: Edition, version: Option<&str>) -> Result<(Release, PathBuf), String> {
+    let pick = |releases: Vec<Release>| -> Result<Release, String> {
+        match version {
+            Some(v) => releases.into_iter().find(|r| r.version == v).ok_or_else(|| format!("version {v} not found; see arcus_list_versions")),
+            None => releases.into_iter().next().ok_or_else(|| "no releases found".to_string()),
+        }
+    };
+    if edition == Edition::Public {
+        let rel = pick(list_releases(edition, None).map_err(|e| format!("failed to list releases: {e}"))?)?;
+        let path = download_source(&rel, None, home).map_err(|e| format!("download failed: {e}"))?;
+        return Ok((rel, path));
+    }
+    let gh = find_gh(home);
+    let tokens = find_tokens(gh.as_deref());
+    if tokens.is_empty() { return Err(NO_TOKEN.into()); }
+    let res = (|| {
+        let (releases, token) = list_ee_releases(&tokens).map_err(|e| ee_failure("failed to list EE releases", &e))?;
+        let rel = pick(releases)?;
+        let path = download_source(&rel, Some(&token), home).map_err(|e| ee_failure("download failed", &e))?;
+        Ok((rel, path))
+    })();
+    end_ephemeral_login(gh.as_deref());
+    res
 }
 
 /// Runs `f` with each token in turn. A token GitHub rejects (401/403/404) falls through to the next one,
@@ -242,7 +347,9 @@ pub fn parse_device_code(text: &str) -> Option<String> {
 }
 
 /// `EeLogin` job: `gh auth login --web`, publishing the device code as soon as gh prints it.
-pub fn ee_login_job(ctx: &JobCtx, _params: &Value) -> Result<Value, String> {
+/// Params: `{gh_config_dir?}`: a temporary `GH_CONFIG_DIR` (no keyring) for the login.
+pub fn ee_login_job(ctx: &JobCtx, params: &Value) -> Result<Value, String> {
+    let config_dir = params["gh_config_dir"].as_str().map(PathBuf::from);
     let gh = match find_gh(&ctx.home) {
         Some(gh) => gh,
         None => {
@@ -252,7 +359,9 @@ pub fn ee_login_job(ctx: &JobCtx, _params: &Value) -> Result<Value, String> {
     };
     ctx.step("starting gh");
     let log = std::fs::OpenOptions::new().create(true).append(true).open(&ctx.log).map_err(|e| e.to_string())?;
-    let mut child = Command::new(&gh)
+    let mut cmd = Command::new(&gh);
+    if let Some(d) = &config_dir { cmd.env("GH_CONFIG_DIR", d); }
+    let mut child = cmd
         .args(["auth", "login", "--hostname", "github.com", "--web", "--git-protocol", "https"])
         .env("GH_BROWSER", "true")
         .env_remove("GITHUB_TOKEN").env_remove("GH_TOKEN")
@@ -289,7 +398,7 @@ pub fn ee_login_job(ctx: &JobCtx, _params: &Value) -> Result<Value, String> {
     if !status.success() { return Err(format!("gh auth login failed ({status})")); }
     ctx.step("verifying access");
     // Check the login token itself, not GITHUB_TOKEN, which may be stale.
-    let token = gh_token(&gh).ok_or("login finished but no token is available")?;
+    let token = gh_token(&gh, config_dir.as_deref()).ok_or("login finished but no token is available")?;
     let versions = list_releases(Edition::Ee, Some(&token)).map_err(|e| ee_access_error(&e))?;
     Ok(json!({"code": code, "url": DEVICE_URL, "ee_versions": versions.len()}))
 }
@@ -381,6 +490,26 @@ mod tests {
     fn device_code_parsed() {
         assert_eq!(parse_device_code("! First copy your one-time code: 1A2B-3C4D\nOpen this URL..."), Some("1A2B-3C4D".into()));
         assert_eq!(parse_device_code("nothing"), None);
+    }
+
+    #[test]
+    fn gh_config_selection() {
+        let rt = std::env::temp_dir().join(format!("arcus-rt-{}", std::process::id()));
+        std::fs::create_dir_all(&rt).unwrap();
+        // macOS and Linux with a keyring: gh's normal config
+        assert_eq!(select_gh_config("macos", false, None), Ok(GhConfig::Normal));
+        assert_eq!(select_gh_config("linux", true, None), Ok(GhConfig::Normal));
+        // no keyring + XDG_RUNTIME_DIR: the tmpfs dir
+        assert_eq!(select_gh_config("linux", false, Some(&rt)), Ok(GhConfig::Ephemeral(rt.join(EPHEMERAL_GH_DIR))));
+        // neither: an error, never a disk fallback
+        let e = select_gh_config("linux", false, None).unwrap_err();
+        assert!(e.contains("keyring") && e.contains("XDG_RUNTIME_DIR"), "{e}");
+        assert!(select_gh_config("linux", false, Some(&rt.join("missing"))).is_err());
+        let d = rt.join("priv");
+        create_private_dir(&d).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
+        let _ = std::fs::remove_dir_all(&rt);
     }
 
     #[test]

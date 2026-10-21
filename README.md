@@ -107,7 +107,7 @@ args = ["--mcp"]
 | `arcus_list_features` | Optional build features per edition (public / ee) |
 | `arcus_check_prerequisites` | Report missing build tools and the command to install them |
 | `arcus_list_versions` | Installable server versions per edition |
-| `arcus_ee_login` | GitHub device-code login for the private EE sources (`accept_plaintext_token` on Linux without a keyring) |
+| `arcus_ee_login` | GitHub device-code login for the private EE sources (this computer only) |
 | `arcus_install` | Build and install a server from source (background job) |
 | `arcus_job_status` | Poll a background job |
 | `arcus_zk_start` / `arcus_zk_stop` | Start or stop a local ZooKeeper ensemble of 1-7 nodes (downloads it first if needed). `count`, `client_ports`, `peer_ports`, `election_ports` (or `base_*_port`) and `version` are all chosen by the user; the recommended values are 3 nodes on 2181-2183 / 2888-2890 / 3888-3890. The running ensemble is recorded in `zk/ensemble.json`, and `arcus_setup` with `zk: "local"` uses it |
@@ -123,7 +123,12 @@ args = ["--mcp"]
 a URL; open the URL, enter the code and approve. The token stays in gh's own
 credential store; `arcus-cli` does not save it, and it never passes through the
 AI conversation. Afterwards
-`arcus_list_versions` and `arcus_install` work for `edition: "ee"`.
+`arcus_list_versions` and `arcus_install` work for `edition: "ee"`. On Linux
+without a keyring the login is never written to disk: gh keeps it in
+`$XDG_RUNTIME_DIR/arcus-cli-gh` (tmpfs, mode 700), and it is logged out and
+removed as soon as the next EE download finishes, so the next EE install asks
+for a login again. Without a keyring and without `XDG_RUNTIME_DIR` the login is
+refused (set `GITHUB_TOKEN` in the MCP server env instead).
 
 ### Remote machines
 
@@ -160,10 +165,11 @@ forwarded to `~/.arcus-cli/bin/arcus-cli --call <tool>` on that machine.
   the connect string for `arcus_setup`.
 - **Cluster status**: `arcus_cluster_status` runs `arcus_status` on all registered
   machines (or the given `machines`) in parallel.
-- **EE login**: on a machine without a keyring, `arcus_ee_login` requires
-  `accept_plaintext_token: true` (always required over SSH, since a keyring prompt
-  cannot be seen there); gh then keeps the token in
-  `~/.config/gh/hosts.yml` (mode 600).
+- **EE sources**: only this computer talks to GitHub. `arcus_install` with
+  `machine` and `edition: "ee"` resolves the version and downloads the EE tarball
+  here, copies it to `~/.arcus-cli/downloads/` on the machine with scp, and the
+  machine builds from that file. Remote machines need neither gh nor a token, so
+  `arcus_ee_login` does not take `machine`; `arcus_list_versions` always runs here.
 
 Known limits: on macOS the exit status of a server is unknown after its
 supervisor dies. Installing from a release needs a release tag matching the
