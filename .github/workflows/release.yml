@@ -40,7 +40,7 @@ jobs:
         if: matrix.zigbuild
         run: |
           python3 -m pip install --user ziglang==0.13.0
-          cargo install cargo-zigbuild --version 0.19.8 --locked
+          cargo install cargo-zigbuild --version 0.23.4 --locked
           echo "$(python3 -m site --user-base)/bin" >> "$GITHUB_PATH"
 
       - name: Build (glibc 2.28)
