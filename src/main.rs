@@ -109,10 +109,14 @@ fn main() -> rustyline::Result<()> {
             Err(e) => { eprintln!("ERROR: cannot prepare home directory: {e}"); std::process::exit(1); }
         };
         if args.mcp {
+            let gh = server::release::find_gh(&home);
             let ctx = mcp::Ctx { home };
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
-            if let Err(e) = mcp::serve(stdin.lock(), stdout.lock(), mcp::tools::registry(), ctx) {
+            let served = mcp::serve(stdin.lock(), stdout.lock(), mcp::tools::registry(), ctx);
+            // A temporary gh login (no keyring) lives as long as this MCP server session (stdin EOF included).
+            server::release::end_ephemeral_login(gh.as_deref());
+            if let Err(e) = served {
                 eprintln!("ERROR: {e}");
                 std::process::exit(1);
             }

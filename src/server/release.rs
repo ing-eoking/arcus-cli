@@ -95,7 +95,7 @@ pub fn download_source(rel: &Release, token: Option<&Token>, home: &Home) -> io:
 pub enum GhConfig {
     /// gh's own config (macOS keychain, or a Linux keyring).
     Normal,
-    /// Linux without a keyring: a temporary `GH_CONFIG_DIR` on the tmpfs `$XDG_RUNTIME_DIR`, removed after the download.
+    /// Linux without a keyring: a temporary `GH_CONFIG_DIR` on the tmpfs `$XDG_RUNTIME_DIR`, removed when the MCP server exits.
     Ephemeral(PathBuf),
 }
 
@@ -149,15 +149,19 @@ pub fn create_private_dir(dir: &Path) -> io::Result<()> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
-/// Ends a temporary login: `gh auth logout` in that config dir, then removes the dir. No-op without one.
+/// Ends the temporary login when the MCP server exits: `gh auth logout` in that config dir, then removes the dir.
+/// No-op without one.
 pub fn end_ephemeral_login(gh: Option<&Path>) {
-    let Some(dir) = ephemeral_gh_dir() else { return };
+    if let Some(dir) = ephemeral_gh_dir() { end_login_in(&dir, gh); }
+}
+
+fn end_login_in(dir: &Path, gh: Option<&Path>) {
     if let Some(gh) = gh {
         let _ = Command::new(gh).args(["auth", "logout", "--hostname", "github.com"])
-            .env("GH_CONFIG_DIR", &dir).env_remove("GH_TOKEN").env_remove("GITHUB_TOKEN")
+            .env("GH_CONFIG_DIR", dir).env_remove("GH_TOKEN").env_remove("GITHUB_TOKEN")
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The token `<gh> auth token` prints (read-only); `config_dir` is a `GH_CONFIG_DIR` to read instead of gh's default.
@@ -193,9 +197,17 @@ pub fn find_tokens(gh: Option<&Path>) -> Vec<Token> {
 pub const NO_TOKEN: &str = "no GitHub token found on this computer for the EE edition; call arcus_ee_login (without `machine`), \
     show the code and URL to the user, then retry";
 
+/// The EE tarball of `version` already in `downloads/` (written only after its checksum was verified).
+fn cached_ee(home: &Home, version: &str) -> Option<(Release, PathBuf)> {
+    semver(version)?;
+    let asset_name = format!("arcus-memcached-EE-{version}.tar.gz");
+    let path = home.downloads().join(&asset_name);
+    path.is_file().then(|| (Release { version: version.to_string(), asset_name, asset_api_url: String::new(), sha256: None }, path))
+}
+
 /// Resolves `version` (default: the newest) and downloads its source tarball into `downloads/` (cached).
-/// For EE the token is looked up here and never leaves this function; a temporary gh login (no keyring)
-/// is logged out and removed once the download has finished or failed.
+/// For EE the token is looked up here and never leaves this function; a given version that is already
+/// cached needs no token at all.
 pub fn fetch_source(home: &Home, edition: Edition, version: Option<&str>) -> Result<(Release, PathBuf), String> {
     let pick = |releases: Vec<Release>| -> Result<Release, String> {
         match version {
@@ -208,17 +220,13 @@ pub fn fetch_source(home: &Home, edition: Edition, version: Option<&str>) -> Res
         let path = download_source(&rel, None, home).map_err(|e| format!("download failed: {e}"))?;
         return Ok((rel, path));
     }
-    let gh = find_gh(home);
-    let tokens = find_tokens(gh.as_deref());
+    if let Some(hit) = version.and_then(|v| cached_ee(home, v)) { return Ok(hit); }
+    let tokens = find_tokens(find_gh(home).as_deref());
     if tokens.is_empty() { return Err(NO_TOKEN.into()); }
-    let res = (|| {
-        let (releases, token) = list_ee_releases(&tokens).map_err(|e| ee_failure("failed to list EE releases", &e))?;
-        let rel = pick(releases)?;
-        let path = download_source(&rel, Some(&token), home).map_err(|e| ee_failure("download failed", &e))?;
-        Ok((rel, path))
-    })();
-    end_ephemeral_login(gh.as_deref());
-    res
+    let (releases, token) = list_ee_releases(&tokens).map_err(|e| ee_failure("failed to list EE releases", &e))?;
+    let rel = pick(releases)?;
+    let path = download_source(&rel, Some(&token), home).map_err(|e| ee_failure("download failed", &e))?;
+    Ok((rel, path))
 }
 
 /// Runs `f` with each token in turn. A token GitHub rejects (401/403/404) falls through to the next one,
@@ -510,6 +518,31 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
         let _ = std::fs::remove_dir_all(&rt);
+    }
+
+    #[test]
+    fn cached_ee_version_needs_no_token() {
+        let root = std::env::temp_dir().join(format!("arcus-cache-ee-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = Home::new(Some(root.clone())).unwrap();
+        std::fs::create_dir_all(home.downloads()).unwrap();
+        std::fs::write(home.downloads().join("arcus-memcached-EE-0.12.1.tar.gz"), b"t").unwrap();
+        // returns before any token lookup or GitHub call
+        let (rel, path) = fetch_source(&home, Edition::Ee, Some("0.12.1")).unwrap();
+        assert_eq!((rel.version.as_str(), rel.asset_name.as_str()), ("0.12.1", "arcus-memcached-EE-0.12.1.tar.gz"));
+        assert_eq!(path, home.downloads().join("arcus-memcached-EE-0.12.1.tar.gz"));
+        assert!(cached_ee(&home, "0.12.2").is_none());
+        assert!(cached_ee(&home, "../x").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ending_a_login_removes_the_dir() {
+        let d = std::env::temp_dir().join(format!("arcus-endlogin-{}", std::process::id()));
+        create_private_dir(&d).unwrap();
+        std::fs::write(d.join("hosts.yml"), "x").unwrap();
+        end_login_in(&d, None);
+        assert!(!d.exists());
     }
 
     #[test]

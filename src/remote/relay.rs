@@ -8,7 +8,7 @@ use crate::remote::machines::resolve;
 use crate::remote::ssh::{HostKeyPolicy, Runner, Ssh, SshError};
 use crate::server::features::Edition;
 use crate::server::home::Home;
-use crate::server::release::{ephemeral_gh_dir, fetch_source};
+use crate::server::release::fetch_source;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -17,18 +17,16 @@ pub struct EeSource {
     pub version: String,
     pub asset_name: String,
     pub path: PathBuf,
-    /// The GitHub login was temporary (no keyring) and has been removed after the download.
-    pub temporary_login: bool,
 }
 
 /// Fetches the EE source of `version` (default: the newest) on this computer.
 pub type FetchEe<'a> = &'a dyn Fn(&Home, Option<&str>) -> Result<EeSource, String>;
 
-/// The real `FetchEe`: resolve the version and download with this computer's token (cached in `downloads/`).
+/// The real `FetchEe`: resolve the version and download with this computer's token (cached in `downloads/`;
+/// a given version that is already cached needs no token).
 pub fn fetch_ee(home: &Home, version: Option<&str>) -> Result<EeSource, String> {
-    let temporary_login = ephemeral_gh_dir().is_some();
     let (rel, path) = fetch_source(home, Edition::Ee, version)?;
-    Ok(EeSource { version: rel.version, asset_name: rel.asset_name, path, temporary_login })
+    Ok(EeSource { version: rel.version, asset_name: rel.asset_name, path })
 }
 
 /// Remote directory (relative to the remote home, where scp and `--home ~/.arcus-cli` both start).
@@ -64,12 +62,21 @@ pub(crate) fn relay_with(ctx: &Ctx, args: &Value, machine: &str, runner: &dyn Ru
         Ok(o) => return ToolResult::err(format!("cannot create ~/{REMOTE_DOWNLOADS} on `{machine}` ({}): {}", o.status, o.stderr.trim())),
         Err(e) => return ssh_failure(machine, e),
     }
-    if let Err(e) = ssh.copy(&src.path, &format!("{REMOTE_DOWNLOADS}/{}", src.asset_name)) {
+    /* Copy to `<asset>.part`, then move it into place, so the remote never sees a partial tarball under the final name. */
+    let dest = format!("{REMOTE_DOWNLOADS}/{}", src.asset_name);
+    let part = format!("{dest}.part");
+    if let Err(e) = ssh.copy(&src.path, &part) {
+        let _ = ssh.exec(&format!("rm -f ~/{part}"), b"");
         return match e {
             SshError::Remote { status, stderr } => ToolResult::err(format!(
                 "copying {} to `{machine}` failed ({status}): {}", src.asset_name, stderr.trim())),
             e => ssh_failure(machine, e),
         };
+    }
+    match ssh.exec(&format!("mv -f ~/{part} ~/{dest} || {{ rm -f ~/{part}; exit 1; }}"), b"") {
+        Ok(o) if o.status == 0 => {}
+        Ok(o) => return ToolResult::err(format!("cannot move {} into place on `{machine}` ({}): {}", src.asset_name, o.status, o.stderr.trim())),
+        Err(e) => return ssh_failure(machine, e),
     }
     let mut fwd = args.clone();
     fwd["version"] = json!(src.version);
@@ -77,10 +84,6 @@ pub(crate) fn relay_with(ctx: &Ctx, args: &Value, machine: &str, runner: &dyn Ru
     let mut res = forward_with(ctx, "arcus_install", &fwd, machine, runner, config);
     res.text.push_str(&format!("\n(The EE source {} was downloaded by this computer and copied to `{machine}`; \
         `{machine}` needs no GitHub login.)", src.asset_name));
-    if src.temporary_login {
-        res.text.push_str(" Tell the user: the GitHub login on this computer was temporary (no keyring) and has been removed; \
-            the next EE install will ask for arcus_ee_login again.");
-    }
     res
 }
 
@@ -119,10 +122,10 @@ mod tests {
         let asked = RefCell::new(None::<Option<String>>);
         let fetch = |_: &Home, v: Option<&str>| -> Result<EeSource, String> {
             *asked.borrow_mut() = Some(v.map(str::to_string));
-            Ok(EeSource { version: "0.12.1".into(), asset_name: "arcus-memcached-EE-0.12.1.tar.gz".into(), path: tarball.clone(), temporary_login: false })
+            Ok(EeSource { version: "0.12.1".into(), asset_name: "arcus-memcached-EE-0.12.1.tar.gz".into(), path: tarball.clone() })
         };
         let f = Fake { calls: RefCell::new(vec![]), reply: RefCell::new(vec![
-            ok(""), ok(""),
+            ok(""), ok(""), ok(""),
             ok("{\"arcus_call\":1,\"tag\":\"dev\",\"result\":{\"text\":\"Started build\",\"structured\":{\"job_id\":\"install-1\"},\"is_error\":false}}\n"),
         ]) };
         let r = relay_with(&ctx, &json!({"edition": "ee", "features": ["zk"]}), "dev-1", &f, &cfg, &fetch);
@@ -131,18 +134,21 @@ mod tests {
         let s = r.structured.unwrap();
         assert!(s["job_id"] == "install-1" && s["machine"] == "dev-1");
         let calls = f.calls.borrow();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
         assert_eq!(calls[0].0, "ssh");
         assert_eq!(calls[0].1.last().unwrap(), "mkdir -p ~/.arcus-cli/downloads");
         assert_eq!(calls[1].0, "scp");
         assert_eq!(&calls[1].1[calls[1].1.len() - 2..],
-            [tarball.display().to_string(), "dev-1:.arcus-cli/downloads/arcus-memcached-EE-0.12.1.tar.gz".to_string()]);
+            [tarball.display().to_string(), "dev-1:.arcus-cli/downloads/arcus-memcached-EE-0.12.1.tar.gz.part".to_string()]);
+        let a = ".arcus-cli/downloads/arcus-memcached-EE-0.12.1.tar.gz";
         assert_eq!(calls[2].0, "ssh");
-        assert!(calls[2].1.last().unwrap().contains("--call arcus_install"));
-        let sent: Value = serde_json::from_slice(&calls[2].2).unwrap();
+        assert_eq!(*calls[2].1.last().unwrap(), format!("mv -f ~/{a}.part ~/{a} || {{ rm -f ~/{a}.part; exit 1; }}"));
+        assert_eq!(calls[3].0, "ssh");
+        assert!(calls[3].1.last().unwrap().contains("--call arcus_install"));
+        let sent: Value = serde_json::from_slice(&calls[3].2).unwrap();
         assert_eq!(sent, json!({"edition": "ee", "features": ["zk"], "version": "0.12.1",
             "source_file": "~/.arcus-cli/downloads/arcus-memcached-EE-0.12.1.tar.gz"}));
-        let all = String::from_utf8_lossy(&calls[2].2).to_lowercase();
+        let all = String::from_utf8_lossy(&calls[3].2).to_lowercase();
         assert!(!all.contains("token") && !all.contains("machine"), "{all}");
         assert!(r.text.contains("needs no GitHub login"), "{}", r.text);
     }
@@ -161,11 +167,25 @@ mod tests {
     fn scp_failure_is_reported() {
         let (ctx, cfg, tarball) = setup("scp");
         let fetch = |_: &Home, _: Option<&str>| Ok(EeSource { version: "0.12.1".into(),
-            asset_name: "arcus-memcached-EE-0.12.1.tar.gz".into(), path: tarball.clone(), temporary_login: true });
+            asset_name: "arcus-memcached-EE-0.12.1.tar.gz".into(), path: tarball.clone() });
         let f = Fake { calls: RefCell::new(vec![]), reply: RefCell::new(vec![
             ok(""), SshOutput { status: 1, stdout: vec![], stderr: "scp: disk full".into() }]) };
         let r = relay_with(&ctx, &json!({"edition": "ee", "features": []}), "dev-1", &f, &cfg, &fetch);
         assert!(r.is_error && r.text.contains("disk full"), "{}", r.text);
-        assert_eq!(f.calls.borrow().len(), 2);
+        let calls = f.calls.borrow();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[2].1.last().unwrap(), "rm -f ~/.arcus-cli/downloads/arcus-memcached-EE-0.12.1.tar.gz.part");
+    }
+
+    #[test]
+    fn failed_move_is_reported_and_not_forwarded() {
+        let (ctx, cfg, tarball) = setup("mv");
+        let fetch = |_: &Home, _: Option<&str>| Ok(EeSource { version: "0.12.1".into(),
+            asset_name: "arcus-memcached-EE-0.12.1.tar.gz".into(), path: tarball.clone() });
+        let f = Fake { calls: RefCell::new(vec![]), reply: RefCell::new(vec![
+            ok(""), ok(""), SshOutput { status: 1, stdout: vec![], stderr: "mv: read-only".into() }]) };
+        let r = relay_with(&ctx, &json!({"edition": "ee", "features": []}), "dev-1", &f, &cfg, &fetch);
+        assert!(r.is_error && r.text.contains("read-only"), "{}", r.text);
+        assert_eq!(f.calls.borrow().len(), 3);
     }
 }

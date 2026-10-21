@@ -125,9 +125,10 @@ credential store; `arcus-cli` does not save it, and it never passes through the
 AI conversation. Afterwards
 `arcus_list_versions` and `arcus_install` work for `edition: "ee"`. On Linux
 without a keyring the login is never written to disk: gh keeps it in
-`$XDG_RUNTIME_DIR/arcus-cli-gh` (tmpfs, mode 700), and it is logged out and
-removed as soon as the next EE download finishes, so the next EE install asks
-for a login again. Without a keyring and without `XDG_RUNTIME_DIR` the login is
+`$XDG_RUNTIME_DIR/arcus-cli-gh` (tmpfs, mode 700) for the lifetime of the MCP
+server session: one login serves every EE install of the session, and it is
+logged out and removed when the server exits (tmpfs is also cleared on logout
+or reboot), so the next session asks for a login again. Without a keyring and without `XDG_RUNTIME_DIR` the login is
 refused (set `GITHUB_TOKEN` in the MCP server env instead).
 
 ### Remote machines
@@ -167,7 +168,8 @@ forwarded to `~/.arcus-cli/bin/arcus-cli --call <tool>` on that machine.
   machines (or the given `machines`) in parallel.
 - **EE sources**: only this computer talks to GitHub. `arcus_install` with
   `machine` and `edition: "ee"` resolves the version and downloads the EE tarball
-  here, copies it to `~/.arcus-cli/downloads/` on the machine with scp, and the
+  here (a cached version needs no token), copies it to `~/.arcus-cli/downloads/`
+  on the machine with scp (via a `.part` file), and the
   machine builds from that file. Remote machines need neither gh nor a token, so
   `arcus_ee_login` does not take `machine`; `arcus_list_versions` always runs here.
 

@@ -357,7 +357,7 @@ impl Tool for EeLogin {
             description: "Start a GitHub browser (device) login on this computer to get access to the private EE sources. Returns a one-time \
                 code and URL; show both to the user, who approves in a browser. No token passes through this conversation. \
                 Only this computer logs in: for other machines the EE source is downloaded here and copied to them. \
-                On Linux without a keyring the login is kept only in a temporary directory and removed after the next EE download.",
+                On Linux without a keyring the login is kept only in a temporary directory (tmpfs) until this MCP server exits.",
             input_schema: json!({"type": "object", "properties": {}}),
         }
     }
@@ -393,8 +393,8 @@ impl Tool for EeLogin {
     }
 }
 
-const TEMP_LOGIN_NOTE: &str = " Also tell the user: this computer has no keyring, so the login is temporary (kept in $XDG_RUNTIME_DIR, never on disk) \
-    and is removed after the next EE download; it will be asked again next time.";
+const TEMP_LOGIN_NOTE: &str = " Also tell the user: this computer has no keyring, so the login is temporary (kept in $XDG_RUNTIME_DIR, never on disk): \
+    it lasts until this MCP server exits (tmpfs is also cleared on logout or reboot) and will be asked again next session.";
 
 const REMOTE_LOGIN_ERROR: &str = "Remote machines need no GitHub login: the EE source is downloaded by this computer and copied to them \
     when arcus_install runs with `machine`. Nothing was done. If this computer has no EE access yet, call arcus_ee_login without `machine`.";
@@ -530,12 +530,9 @@ impl Tool for Install {
             "build_key": key,
         });
         if let Some(src) = &source { params["source_file"] = json!(src.display().to_string()); }
-        let temporary = edition == Edition::Ee && source.is_none() && release::ephemeral_gh_dir().is_some();
         match jobs::submit(&ctx.home, JobSpec { kind: JobKind::Install, params }) {
             Ok(id) => ToolResult::ok(
-                format!("Started build {key} as job {id}. Poll arcus_job_status with this id until it is succeeded.{}",
-                    if temporary { " Tell the user: the GitHub login on this computer is temporary (no keyring) and is removed \
-                        once this download finishes; the next EE install will ask for arcus_ee_login again." } else { "" }),
+                format!("Started build {key} as job {id}. Poll arcus_job_status with this id until it is succeeded."),
                 Some(json!({"job_id": id, "build_key": key}))),
             Err(e) => ToolResult::err(format!("failed to start the install job: {e}")),
         }
