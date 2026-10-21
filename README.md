@@ -128,7 +128,9 @@ without a keyring the login is never written to disk: gh keeps it in
 `$XDG_RUNTIME_DIR/arcus-cli-gh` (tmpfs, mode 700) for the lifetime of the MCP
 server session: one login serves every EE install of the session, and it is
 logged out and removed when the server exits (tmpfs is also cleared on logout
-or reboot), so the next session asks for a login again. Without a keyring and without `XDG_RUNTIME_DIR` the login is
+or reboot), so the next session asks for a login again. Each MCP server session
+uses its own directory (`arcus-cli-gh-<pid>`). If the server is killed by a
+signal, the login stays in tmpfs until the user logs out or reboots. Without a keyring and without `XDG_RUNTIME_DIR` the login is
 refused (set `GITHUB_TOKEN` in the MCP server env instead).
 
 ### Remote machines
@@ -172,6 +174,8 @@ forwarded to `~/.arcus-cli/bin/arcus-cli --call <tool>` on that machine.
   on the machine with scp (via a `.part` file), and the
   machine builds from that file. Remote machines need neither gh nor a token, so
   `arcus_ee_login` does not take `machine`; `arcus_list_versions` always runs here.
+  Machines that logged in with the old `accept_plaintext_token` flow still have a
+  token in `~/.config/gh/hosts.yml`: run `gh auth logout` there to remove it.
 
 Known limits: on macOS the exit status of a server is unknown after its
 supervisor dies. Installing from a release needs a release tag matching the

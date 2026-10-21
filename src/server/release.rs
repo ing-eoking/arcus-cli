@@ -39,6 +39,9 @@ impl fmt::Display for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("***") }
 }
 
+/// Whether `s` is an `X.Y.Z` release version (safe as part of a path).
+pub fn valid_version(s: &str) -> bool { semver(s).is_some() }
+
 fn semver(s: &str) -> Option<(u64, u64, u64)> {
     let mut it = s.split('.');
     let t = (it.next()?.parse().ok()?, it.next()?.parse().ok()?, it.next()?.parse().ok()?);
@@ -99,27 +102,38 @@ pub enum GhConfig {
     Ephemeral(PathBuf),
 }
 
-/// Name of the temporary gh config directory under `$XDG_RUNTIME_DIR`.
+/// Prefix of the per-session temporary gh config directory under `$XDG_RUNTIME_DIR`.
 pub const EPHEMERAL_GH_DIR: &str = "arcus-cli-gh";
 
-/// Chooses where a new gh login goes. Without a keyring on Linux the login never goes to disk:
-/// it needs `$XDG_RUNTIME_DIR` (tmpfs), otherwise this is an error.
-pub fn select_gh_config(os: &str, keyring: bool, runtime_dir: Option<&Path>) -> Result<GhConfig, String> {
+/// The temporary gh config directory of the MCP server session `pid`: `$XDG_RUNTIME_DIR/arcus-cli-gh-<pid>`,
+/// or `None` when the runtime dir is missing (then no temporary login is possible).
+pub fn session_gh_dir(runtime_dir: Option<&Path>, pid: u32) -> Option<PathBuf> {
+    runtime_dir.filter(|d| d.is_dir()).map(|d| d.join(format!("{EPHEMERAL_GH_DIR}-{pid}")))
+}
+
+/// `session_gh_dir` for this process.
+pub fn current_session_gh_dir() -> Option<PathBuf> {
+    let rt = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()).map(PathBuf::from);
+    session_gh_dir(rt.as_deref(), std::process::id())
+}
+
+/// Chooses where a new gh login goes. Without a keyring on Linux the login never goes to disk: it goes to the
+/// session's tmpfs dir (`session_dir`), and without one this is an error.
+pub fn select_gh_config(os: &str, keyring: bool, session_dir: Option<&Path>) -> Result<GhConfig, String> {
     if os != "linux" || keyring { return Ok(GhConfig::Normal); }
-    match runtime_dir.filter(|d| d.is_dir()) {
-        Some(d) => Ok(GhConfig::Ephemeral(d.join(EPHEMERAL_GH_DIR))),
-        None => Err("this computer has no keyring (Secret Service) and XDG_RUNTIME_DIR is not set, so the GitHub login \
+    match session_dir {
+        Some(d) => Ok(GhConfig::Ephemeral(d.to_path_buf())),
+        None => Err("this computer has no keyring (Secret Service) and XDG_RUNTIME_DIR is not set or not a directory, so the GitHub login \
             could only be stored on disk, which arcus-cli does not allow. Ask the user to run the MCP client in a desktop session \
             with a keyring, or in a login session that provides XDG_RUNTIME_DIR, or to set GITHUB_TOKEN in the MCP server env.".into()),
     }
 }
 
 /// `select_gh_config` for this process (Linux keyring detected through the Secret Service).
-pub fn current_gh_config() -> Result<GhConfig, String> {
+pub fn current_gh_config(session_dir: Option<&Path>) -> Result<GhConfig, String> {
     let os = std::env::consts::OS;
     let keyring = os == "linux" && secret_service_available();
-    let rt = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()).map(PathBuf::from);
-    select_gh_config(os, keyring, rt.as_deref())
+    select_gh_config(os, keyring, session_dir)
 }
 
 /// Whether `org.freedesktop.secrets` has an owner on the session bus (a mere D-Bus session address is not enough:
@@ -135,13 +149,6 @@ pub fn secret_service_available() -> bool {
     run("busctl", &["--user", "status", "org.freedesktop.secrets"]).is_some_and(|o| o.status.success())
 }
 
-/// The temporary gh config directory when it exists (a login made without a keyring).
-pub fn ephemeral_gh_dir() -> Option<PathBuf> {
-    let rt = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty())?;
-    let d = PathBuf::from(rt).join(EPHEMERAL_GH_DIR);
-    d.is_dir().then_some(d)
-}
-
 /// Creates the temporary gh config directory with mode 700.
 pub fn create_private_dir(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -149,10 +156,12 @@ pub fn create_private_dir(dir: &Path) -> io::Result<()> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
-/// Ends the temporary login when the MCP server exits: `gh auth logout` in that config dir, then removes the dir.
-/// No-op without one.
-pub fn end_ephemeral_login(gh: Option<&Path>) {
-    if let Some(dir) = ephemeral_gh_dir() { end_login_in(&dir, gh); }
+/// Ends the session's temporary login when the MCP server exits: stops a login job of this session that is
+/// still running, runs `gh auth logout` in that config dir (gh looked up now: it may have been downloaded
+/// during the session) and removes the dir. No-op when the dir does not exist.
+pub fn end_session_login(home: &Home, dir: &Path) {
+    super::jobs::kill_running(home, super::jobs::JobKind::EeLogin, "gh_config_dir", &dir.display().to_string());
+    if dir.is_dir() { end_login_in(dir, find_gh(home).as_deref()); }
 }
 
 fn end_login_in(dir: &Path, gh: Option<&Path>) {
@@ -187,10 +196,11 @@ pub fn candidate_tokens(env: Option<Token>, gh: Option<Token>) -> Vec<Token> {
     v
 }
 
-/// All usable tokens: `GITHUB_TOKEN`, then `<gh> auth token` (from the temporary gh config dir when it exists).
-pub fn find_tokens(gh: Option<&Path>) -> Vec<Token> {
-    let dir = ephemeral_gh_dir();
-    candidate_tokens(env_token(), gh.and_then(|g| gh_token(g, dir.as_deref())))
+/// All usable tokens: `GITHUB_TOKEN`, then `<gh> auth token` (from the session's temporary gh config dir
+/// `session_dir` when it exists, otherwise gh's own config).
+pub fn find_tokens(gh: Option<&Path>, session_dir: Option<&Path>) -> Vec<Token> {
+    let dir = session_dir.filter(|d| d.is_dir());
+    candidate_tokens(env_token(), gh.and_then(|g| gh_token(g, dir)))
 }
 
 /// Error when no token exists for the EE edition.
@@ -208,7 +218,7 @@ fn cached_ee(home: &Home, version: &str) -> Option<(Release, PathBuf)> {
 /// Resolves `version` (default: the newest) and downloads its source tarball into `downloads/` (cached).
 /// For EE the token is looked up here and never leaves this function; a given version that is already
 /// cached needs no token at all.
-pub fn fetch_source(home: &Home, edition: Edition, version: Option<&str>) -> Result<(Release, PathBuf), String> {
+pub fn fetch_source(home: &Home, edition: Edition, version: Option<&str>, session_dir: Option<&Path>) -> Result<(Release, PathBuf), String> {
     let pick = |releases: Vec<Release>| -> Result<Release, String> {
         match version {
             Some(v) => releases.into_iter().find(|r| r.version == v).ok_or_else(|| format!("version {v} not found; see arcus_list_versions")),
@@ -221,7 +231,7 @@ pub fn fetch_source(home: &Home, edition: Edition, version: Option<&str>) -> Res
         return Ok((rel, path));
     }
     if let Some(hit) = version.and_then(|v| cached_ee(home, v)) { return Ok(hit); }
-    let tokens = find_tokens(find_gh(home).as_deref());
+    let tokens = find_tokens(find_gh(home).as_deref(), session_dir);
     if tokens.is_empty() { return Err(NO_TOKEN.into()); }
     let (releases, token) = list_ee_releases(&tokens).map_err(|e| ee_failure("failed to list EE releases", &e))?;
     let rel = pick(releases)?;
@@ -508,11 +518,15 @@ mod tests {
         assert_eq!(select_gh_config("macos", false, None), Ok(GhConfig::Normal));
         assert_eq!(select_gh_config("linux", true, None), Ok(GhConfig::Normal));
         // no keyring + XDG_RUNTIME_DIR: the tmpfs dir
-        assert_eq!(select_gh_config("linux", false, Some(&rt)), Ok(GhConfig::Ephemeral(rt.join(EPHEMERAL_GH_DIR))));
+        let sd = session_gh_dir(Some(&rt), 42).unwrap();
+        assert_eq!(sd, rt.join("arcus-cli-gh-42"));
+        assert_eq!(select_gh_config("linux", false, Some(&sd)), Ok(GhConfig::Ephemeral(sd.clone())));
         // neither: an error, never a disk fallback
         let e = select_gh_config("linux", false, None).unwrap_err();
-        assert!(e.contains("keyring") && e.contains("XDG_RUNTIME_DIR"), "{e}");
-        assert!(select_gh_config("linux", false, Some(&rt.join("missing"))).is_err());
+        assert!(e.contains("keyring") && e.contains("XDG_RUNTIME_DIR is not set or not a directory"), "{e}");
+        assert_eq!(session_gh_dir(Some(&rt.join("missing")), 42), None);
+        assert_eq!(session_gh_dir(None, 42), None);
+        assert!(valid_version("0.12.1") && !valid_version("1/../../../x") && !valid_version("1.2"));
         let d = rt.join("priv");
         create_private_dir(&d).unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -528,7 +542,7 @@ mod tests {
         std::fs::create_dir_all(home.downloads()).unwrap();
         std::fs::write(home.downloads().join("arcus-memcached-EE-0.12.1.tar.gz"), b"t").unwrap();
         // returns before any token lookup or GitHub call
-        let (rel, path) = fetch_source(&home, Edition::Ee, Some("0.12.1")).unwrap();
+        let (rel, path) = fetch_source(&home, Edition::Ee, Some("0.12.1"), None).unwrap();
         assert_eq!((rel.version.as_str(), rel.asset_name.as_str()), ("0.12.1", "arcus-memcached-EE-0.12.1.tar.gz"));
         assert_eq!(path, home.downloads().join("arcus-memcached-EE-0.12.1.tar.gz"));
         assert!(cached_ee(&home, "0.12.2").is_none());

@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use super::features::{configure_args, Feature};
 use super::features::Edition;
 use super::jobs::{tail, JobCtx};
-use super::release::fetch_source;
+use super::release::{fetch_source, valid_version};
 use serde_json::{json, Value};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -157,11 +157,13 @@ fn parse_edition(s: &str) -> Result<Edition, String> {
     }
 }
 
-/// Job handler for `JobKind::Install`. Params: `{edition, version, features: [..], build_key, source_file?}`.
+/// Job handler for `JobKind::Install`. Params: `{edition, version, features: [..], build_key, source_file?, gh_config_dir?}`
+/// (`gh_config_dir`: the MCP session's temporary gh config dir, a path, never a token).
 /// The token is looked up here, never stored in params. With `source_file` (a tarball already on this
 /// machine, e.g. relayed by the controller) nothing is listed or downloaded.
 pub fn install_job(ctx: &JobCtx, params: &Value) -> Result<Value, String> {
-    install_job_with(ctx, params, &|e, v| fetch_source(&ctx.home, e, Some(v)).map(|(_, p)| p), &mut RealRunner)
+    let session_dir = params["gh_config_dir"].as_str().map(PathBuf::from);
+    install_job_with(ctx, params, &|e, v| fetch_source(&ctx.home, e, Some(v), session_dir.as_deref()).map(|(_, p)| p), &mut RealRunner)
 }
 
 /// Downloads the source of `(edition, version)` and returns the local tarball.
@@ -170,6 +172,7 @@ type FetchFn<'a> = &'a dyn Fn(Edition, &str) -> Result<PathBuf, String>;
 fn install_job_with(ctx: &JobCtx, params: &Value, fetch: FetchFn, runner: &mut dyn Runner) -> Result<Value, String> {
     let edition = parse_edition(params["edition"].as_str().unwrap_or(""))?;
     let version = params["version"].as_str().ok_or("missing version")?.to_string();
+    if !valid_version(&version) { return Err(format!("invalid version `{version}`: expected X.Y.Z")); }
     let key = params["build_key"].as_str().ok_or("missing build_key")?.to_string();
     let features: BTreeSet<Feature> = serde_json::from_value(params["features"].clone()).map_err(|e| e.to_string())?;
     let source = params["source_file"].as_str().filter(|s| !s.is_empty()).map(PathBuf::from);
@@ -337,6 +340,11 @@ mod tests {
         p2.as_object_mut().unwrap().remove("source_file");
         let e = install_job_with(&ctx, &p2, &fetch, &mut r).unwrap_err();
         assert!(fetched.get() && e.contains("token"), "{e}");
+        // a version that would leave builds/ is refused before anything else
+        let mut p3 = p.clone();
+        p3["version"] = json!("1/../../../x");
+        let e = install_job_with(&ctx, &p3, &fetch, &mut r).unwrap_err();
+        assert!(e.contains("invalid version"), "{e}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

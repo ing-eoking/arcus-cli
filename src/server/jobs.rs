@@ -216,6 +216,28 @@ pub fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(p, 0) == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
 }
 
+/// Stops (SIGTERM to its process group) every running job of `kind` whose `params[key]` is `value`.
+/// Returns how many were signalled.
+pub fn kill_running(home: &Home, kind: JobKind, key: &str, value: &str) -> usize {
+    let Ok(entries) = std::fs::read_dir(home.jobs()) else { return 0 };
+    let mut n = 0;
+    for e in entries.flatten() {
+        let id = e.file_name().to_string_lossy().into_owned();
+        let Ok(spec) = std::fs::read(e.path().join("spec.json")) else { continue };
+        let Ok(spec) = serde_json::from_slice::<JobSpec>(&spec) else { continue };
+        if spec.kind != kind || spec.params.get(key).and_then(Value::as_str) != Some(value) { continue; }
+        let Ok(s) = status(home, &id) else { continue };
+        let pid = s.pid.or_else(|| std::fs::read_to_string(e.path().join("pid")).ok().and_then(|t| t.trim().parse().ok()));
+        if s.state != JobState::Running { continue; }
+        let Some(pid) = pid.and_then(|p| libc::pid_t::try_from(p).ok()).filter(|p| *p > 1) else { continue };
+        // Jobs run in their own process group (see `submit`): this also stops a gh child.
+        // SAFETY: sending a signal has no memory-safety implications.
+        unsafe { libc::kill(-pid, libc::SIGTERM); }
+        n += 1;
+    }
+    n
+}
+
 /// Current status; a `running` job whose process is gone is reported as `failed`.
 /// Unknown id -> `ErrorKind::NotFound`.
 pub fn status(home: &Home, id: &str) -> io::Result<JobStatus> {
@@ -266,6 +288,22 @@ mod tests {
         Home::new(Some(d)).unwrap()
     }
 
+    #[test] fn kill_running_stops_only_matching_jobs() {
+        use std::os::unix::process::ExitStatusExt;
+        let h = home("kill");
+        let spawn = || Command::new("sleep").arg("30").process_group(0).spawn().unwrap();
+        let (mut mine, mut other) = (spawn(), spawn());
+        for (child, dir) in [(&mine, "/run/a"), (&other, "/run/b")] {
+            let id = prepare(&h, &JobSpec { kind: JobKind::Test, params: json!({"gh_config_dir": dir}) }).unwrap();
+            std::fs::write(job_dir(&h, &id).unwrap().join("pid"), child.id().to_string()).unwrap();
+        }
+        assert_eq!(kill_running(&h, JobKind::Test, "gh_config_dir", "/run/a"), 1);
+        assert_eq!(mine.wait().unwrap().signal(), Some(libc::SIGTERM));
+        assert!(other.try_wait().unwrap().is_none());
+        let _ = other.kill();
+        let _ = other.wait();
+        assert_eq!(kill_running(&h, JobKind::EeLogin, "gh_config_dir", "/run/b"), 0);
+    }
     #[test] fn job_success_records_result() {
         let h = home("ok");
         let id = prepare(&h, &JobSpec { kind: JobKind::Test, params: json!({"mode": "ok"}) }).unwrap();

@@ -330,7 +330,7 @@ impl Tool for ListVersions {
             other => return ToolResult::err(format!("invalid edition '{other}': use \"public\" or \"ee\"")),
         };
         let listed = if edition == Edition::Ee {
-            let tokens = find_tokens(find_gh(&ctx.home).as_deref());
+            let tokens = find_tokens(find_gh(&ctx.home).as_deref(), ctx.gh_session_dir.as_deref());
             if tokens.is_empty() {
                 return ToolResult::err(format!("No GitHub token found. {NO_LOGIN_HINT}"));
             }
@@ -364,7 +364,7 @@ impl Tool for EeLogin {
     fn call(&self, ctx: &Ctx, _args: &Value) -> ToolResult {
         use crate::server::jobs::{self, JobKind, JobSpec};
         use crate::server::release::GhConfig;
-        let (params, note) = match release::current_gh_config() {
+        let (params, note) = match release::current_gh_config(ctx.gh_session_dir.as_deref()) {
             Ok(GhConfig::Normal) => (json!({}), ""),
             Ok(GhConfig::Ephemeral(dir)) => {
                 if let Err(e) = release::create_private_dir(&dir) {
@@ -483,7 +483,11 @@ impl Tool for Install {
         let (edition, features) = try_arg!(install_edition_features(args));
         let source = arg_opt_str(args, "source_file").map(|s| expand_home(&s));
         if let Some(src) = &source {
-            if arg_opt_str(args, "version").is_none() { return ToolResult::err("source_file needs `version` (the version of that tarball)"); }
+            match arg_opt_str(args, "version") {
+                None => return ToolResult::err("source_file needs `version` (the version of that tarball)"),
+                Some(v) if !release::valid_version(&v) => return ToolResult::err(format!("invalid version `{v}`: expected X.Y.Z")),
+                Some(_) => {}
+            }
             if !src.is_file() { return ToolResult::err(format!("source_file {} does not exist", src.display())); }
         }
         let missing = missing_tools(&on_path);
@@ -495,7 +499,7 @@ impl Tool for Install {
             (Some(_), Some(v)) => v,
             _ => {
                 let releases = if edition == Edition::Ee {
-                    let tokens = find_tokens(find_gh(&ctx.home).as_deref());
+                    let tokens = find_tokens(find_gh(&ctx.home).as_deref(), ctx.gh_session_dir.as_deref());
                     if tokens.is_empty() {
                         return ToolResult::err(format!("No GitHub token found for the EE edition. {NO_LOGIN_HINT}"));
                     }
@@ -530,6 +534,10 @@ impl Tool for Install {
             "build_key": key,
         });
         if let Some(src) = &source { params["source_file"] = json!(src.display().to_string()); }
+        if edition == Edition::Ee && source.is_none()
+            && let Some(d) = ctx.gh_session_dir.as_ref().filter(|d| d.is_dir()) {
+            params["gh_config_dir"] = json!(d.display().to_string());
+        }
         match jobs::submit(&ctx.home, JobSpec { kind: JobKind::Install, params }) {
             Ok(id) => ToolResult::ok(
                 format!("Started build {key} as job {id}. Poll arcus_job_status with this id until it is succeeded."),
@@ -571,16 +579,25 @@ struct RemoteInstall;
 impl Tool for RemoteInstall {
     fn spec(&self) -> ToolSpec { Remote(Install).spec() }
     fn call(&self, ctx: &Ctx, args: &Value) -> ToolResult {
-        let machine = arg_opt_str(args, "machine");
-        match (machine, args.get("edition").and_then(Value::as_str)) {
-            (Some(machine), Some("ee")) => {
-                if let Err(r) = install_edition_features(args) { return r; }
-                let mut rest = args.clone();
-                if let Some(o) = rest.as_object_mut() { o.remove("machine"); o.remove("source_file"); }
-                crate::remote::relay::relay_ee_install(ctx, &rest, &machine, &SystemRunner, &crate::remote::relay::fetch_ee)
-            }
-            _ => Remote(Install).call(ctx, args),
+        remote_install_with(ctx, args,
+            &|ctx, rest, machine| crate::remote::relay::relay_ee_install(ctx, rest, machine, &SystemRunner, &crate::remote::relay::fetch_ee),
+            &|ctx, args| Remote(Install).call(ctx, args))
+    }
+}
+
+type RelayFn<'a> = &'a dyn Fn(&Ctx, &Value, &str) -> ToolResult;
+type PassFn<'a> = &'a dyn Fn(&Ctx, &Value) -> ToolResult;
+
+/// EE with `machine` goes to `relay` (args without `machine` and any caller `source_file`); everything else to `pass`.
+fn remote_install_with(ctx: &Ctx, args: &Value, relay: RelayFn, pass: PassFn) -> ToolResult {
+    match (arg_opt_str(args, "machine"), args.get("edition").and_then(Value::as_str)) {
+        (Some(machine), Some("ee")) => {
+            if let Err(r) = install_edition_features(args) { return r; }
+            let mut rest = args.clone();
+            if let Some(o) = rest.as_object_mut() { o.remove("machine"); o.remove("source_file"); }
+            relay(ctx, &rest, &machine)
         }
+        _ => pass(ctx, args),
     }
 }
 
@@ -1070,7 +1087,7 @@ mod tests {
 
     fn ctx() -> Ctx {
         let root = std::env::temp_dir().join(format!("arcus-tools-{}", std::process::id()));
-        Ctx { home: Home::new(Some(root)).unwrap() }
+        Ctx::new(Home::new(Some(root)).unwrap())
     }
 
     #[test]
@@ -1204,6 +1221,25 @@ mod tests {
     }
 
     #[test]
+    fn remote_install_dispatch() {
+        let c = ctx();
+        let seen = std::cell::RefCell::new(Vec::<(String, Value)>::new());
+        let relay = |_: &Ctx, a: &Value, m: &str| { seen.borrow_mut().push((format!("relay:{m}"), a.clone())); ToolResult::ok("r", None) };
+        let pass = |_: &Ctx, a: &Value| { seen.borrow_mut().push(("pass".into(), a.clone())); ToolResult::ok("p", None) };
+        // ee + machine: relayed; machine and a caller source_file are stripped
+        remote_install_with(&c, &json!({"machine": "dev-1", "edition": "ee", "features": ["zk"], "source_file": "/etc/passwd"}), &relay, &pass);
+        // public + machine, and no machine: the plain wrapper (forward / local) with the original args
+        let public = json!({"machine": "dev-1", "edition": "public", "features": ["zk"]});
+        remote_install_with(&c, &public, &relay, &pass);
+        remote_install_with(&c, &json!({"edition": "ee", "features": []}), &relay, &pass);
+        let seen = seen.borrow();
+        assert_eq!(seen[0], ("relay:dev-1".to_string(), json!({"edition": "ee", "features": ["zk"]})));
+        assert_eq!(seen[1], ("pass".to_string(), public));
+        assert_eq!(seen[2].0, "pass");
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
     fn install_source_file_needs_version_and_file() {
         let t = registry().into_iter().find(|t| t.spec().name == "arcus_install").unwrap();
         let c = ctx();
@@ -1211,6 +1247,8 @@ mod tests {
         assert!(r.is_error && r.text.contains("needs `version`"), "{}", r.text);
         let r = t.call(&c, &json!({"edition": "ee", "features": [], "version": "0.12.1", "source_file": "~/nonexistent-arcus/x.tar.gz"}));
         assert!(r.is_error && r.text.contains("does not exist") && !r.text.contains('~'), "{}", r.text);
+        let r = t.call(&c, &json!({"edition": "ee", "features": [], "version": "1/../../../x", "source_file": "/etc/hosts"}));
+        assert!(r.is_error && r.text.contains("invalid version"), "{}", r.text);
         // remote ee install validates features before any download or ssh
         let r = t.call(&c, &json!({"machine": "dev-x", "edition": "ee", "features": ["bogus"]}));
         assert!(r.is_error && r.text.contains("unknown feature"), "{}", r.text);

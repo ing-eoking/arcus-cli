@@ -140,7 +140,7 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let cfg = d.join("config");
         std::fs::write(&cfg, "Host dev-1\n  HostName 10.0.0.1\n").unwrap();
-        (Ctx { home: Home { root: d.join("home") } }, cfg)
+        (Ctx::new(Home { root: d.join("home") }), cfg)
     }
 
     struct Dummy;

@@ -9,7 +9,17 @@ use std::io::{self, BufRead, Write};
 const LATEST: &str = "2025-06-18";
 const SUPPORTED: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
-pub struct Ctx { pub home: Home }
+pub struct Ctx {
+    pub home: Home,
+    /// This MCP server session's temporary gh config dir (`$XDG_RUNTIME_DIR/arcus-cli-gh-<pid>`), used for
+    /// a login without a keyring; `None` outside `--mcp` or without a runtime dir.
+    pub gh_session_dir: Option<std::path::PathBuf>,
+}
+
+impl Ctx {
+    /// A context without a session gh dir (`--call`, tests).
+    pub fn new(home: Home) -> Ctx { Ctx { home, gh_session_dir: None } }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolResult { pub text: String, pub structured: Option<Value>, pub is_error: bool }
@@ -160,7 +170,7 @@ mod tests {
 
     fn raw(lines: &[&str]) -> String {
         let dir = std::env::temp_dir().join(format!("arcus-cli-mcp-test-{}", std::process::id()));
-        let ctx = Ctx { home: crate::server::home::Home::new(Some(dir)).unwrap() };
+        let ctx = Ctx::new(crate::server::home::Home::new(Some(dir)).unwrap());
         let mut out = Vec::new();
         let input = lines.join("\n") + "\n";
         serve(Cursor::new(input), &mut out, vec![Box::new(Echo), Box::new(Boom)], ctx).unwrap();
@@ -229,7 +239,7 @@ mod tests {
 
     fn call_out(tool: &str, input: &str) -> (bool, String) {
         let dir = std::env::temp_dir().join(format!("arcus-cli-call-test-{}", std::process::id()));
-        let ctx = Ctx { home: crate::server::home::Home::new(Some(dir)).unwrap() };
+        let ctx = Ctx::new(crate::server::home::Home::new(Some(dir)).unwrap());
         let mut out = Vec::new();
         let ok = run_call(tool, Cursor::new(input.to_string()), &mut out, vec![Box::new(Echo), Box::new(Boom)], ctx).unwrap();
         (ok, String::from_utf8(out).unwrap())
